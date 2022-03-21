@@ -1,16 +1,15 @@
 import os
-import glob
-import numpy as np
-
 import cv2
+import glob
+import json
+import numpy as np
 
 import torch
 from torch.utils.data import Dataset
 
 from scipy.spatial.transform import Slerp, Rotation
 
-# NeRF dataset
-import json
+from nerf.utils import *
 
 
 # ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
@@ -128,7 +127,9 @@ class NeRFDataset(Dataset):
                 else:
                     image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
 
-                image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
+                if image.shape[0] != self.H or image.shape[1] != self.W:
+                    image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
+                    
                 image = image.astype(np.float32) / 255 # [H, W, 3/4]
 
                 self.poses.append(pose)
@@ -137,11 +138,6 @@ class NeRFDataset(Dataset):
         self.poses = np.stack(self.poses, axis=0)
         if self.images is not None:
             self.images = np.stack(self.images, axis=0)
-
-        if preload:
-            self.poses = torch.from_numpy(self.poses).cuda()
-            if self.images is not None:
-                self.images = torch.from_numpy(self.images).cuda()
 
         # load intrinsics
         
@@ -160,35 +156,61 @@ class NeRFDataset(Dataset):
         cx = (transform['cx'] / downscale) if 'cx' in transform else (self.H / 2)
         cy = (transform['cy'] / downscale) if 'cy' in transform else (self.W / 2)
 
-        self.intrinsic = np.eye(3, dtype=np.float32)
-        self.intrinsic[0, 0] = fl_x
-        self.intrinsic[1, 1] = fl_y
-        self.intrinsic[0, 2] = cx
-        self.intrinsic[1, 2] = cy
+        # pre-generate rays from poses
+        self.directions = get_ray_directions(self.H, self.W, [fl_x, fl_y], [cx, cy])  # [H, W, 3]
 
+        self.all_rays_o = []
+        self.all_rays_d = []
+        for pose in self.poses:
+            pose = torch.from_numpy(pose)
+            rays_o, rays_d = get_rays(self.directions, pose)  # [H, W, 3]
+            self.all_rays_o.append(rays_o)
+            self.all_rays_d.append(rays_d)
+            
+        if self.images is not None:
+            self.all_rgbs = []
+            for image in self.images:
+                rgb = torch.from_numpy(image) # rgb(a), [H, W, 3/4]
+                self.all_rgbs.append(rgb)
+        else:
+            self.all_rgbs = None
+
+        # free 
+        del self.images
+        del self.poses
+        
+        # stack
+        self.all_rays_o = torch.stack(self.all_rays_o, dim=0) # [N, H, W, 3]
+        self.all_rays_d = torch.stack(self.all_rays_d, dim=0) # [N, H, W, 3]
+        if self.all_rgbs is not None:
+            self.all_rgbs = torch.stack(self.all_rgbs, dim=0)
+
+        # mix all rays from different images in training
+        if self.type == 'train' or self.type == 'all':
+            self.all_rays_o = self.all_rays_o.view(-1, 3) # [NHW, 3]
+            self.all_rays_d = self.all_rays_d.view(-1, 3) # [NHW, 3]
+            if self.all_rgbs is not None:
+                self.all_rgbs = self.all_rgbs.view(-1, self.all_rgbs.shape[-1])
+        
         if preload:
-            self.intrinsic = torch.from_numpy(self.intrinsic).cuda()
+            self.all_rays_o = self.all_rays_o.cuda()
+            self.all_rays_d = self.all_rays_d.cuda()
+            if self.all_rgbs is not None:
+                self.all_rgbs = self.all_rgbs.cuda()
 
 
     def __len__(self):
-        return len(self.poses)
+        return self.all_rays_o.shape[0]
 
     def __getitem__(self, index):
 
         results = {
-            'pose': self.poses[index],
-            'intrinsic': self.intrinsic,
+            'rays_o': self.all_rays_o[index],
+            'rays_d': self.all_rays_d[index],
             'index': index,
         }
 
-        if self.type == 'test':
-            # only string can bypass the default collate, so we don't need to call item: https://github.com/pytorch/pytorch/blob/67a275c29338a6c6cc405bf143e63d53abe600bf/torch/utils/data/_utils/collate.py#L84
-            results['H'] = str(self.H)
-            results['W'] = str(self.W)
-            # blender has test gt, so we also load it
-            if self.mode == 'blender':
-                results['image'] = self.images[index]
-        else:
-            results['image'] = self.images[index]
-            
+        if self.type != 'test' or self.mode == 'blender':    
+            results['rgbs'] = self.all_rgbs[index]
+        
         return results

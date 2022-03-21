@@ -26,6 +26,8 @@ import mcubes
 from rich.console import Console
 from torch_ema import ExponentialMovingAverage
 
+from kornia import create_meshgrid
+
 def seed_everything(seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -36,61 +38,53 @@ def seed_everything(seed):
     #torch.backends.cudnn.benchmark = True
 
 
-def lift(x, y, z, intrinsics):
-    # x, y, z: [B, N]
-    # intrinsics: [B, 3, 3]
+def get_ray_directions(H, W, focal, center=None):
+    """
+    Get ray directions for all pixels in camera coordinate.
+    Reference: https://www.scratchapixel.com/lessons/3d-basic-rendering/
+               ray-tracing-generating-camera-rays/standard-coordinate-systems
+    Inputs:
+        H, W, focal: image height, width and focal length
+    Outputs:
+        directions: (H, W, 3), the direction of the rays in camera coordinate
+    """
+    grid = create_meshgrid(H, W, normalized_coordinates=False)[0] + 0.5
+
+    i, j = grid.unbind(-1)
     
-    fx = intrinsics[..., 0, 0].unsqueeze(-1)
-    fy = intrinsics[..., 1, 1].unsqueeze(-1)
-    cx = intrinsics[..., 0, 2].unsqueeze(-1)
-    cy = intrinsics[..., 1, 2].unsqueeze(-1)
-    sk = intrinsics[..., 0, 1].unsqueeze(-1)
-
-    x_lift = (x - cx + cy * sk / fy - sk * y / fy) / fx * z
-    y_lift = (y - cy) / fy * z
-
-    # homogeneous
-    return torch.stack((x_lift, y_lift, z, torch.ones_like(z)), dim=-1)
-
-# Never cast get_rays! fp16 rays degenerates results seriously!
-@torch.cuda.amp.autocast(enabled=False)
-def get_rays(c2w, intrinsics, H, W, N_rays=-1):
-    # c2w: [B, 4, 4]
-    # intrinsics: [B, 3, 3]
-    # return: rays_o, rays_d: [B, N_rays, 3]
-    # return: select_inds: [B, N_rays]
-
-    device = c2w.device
-    rays_o = c2w[..., :3, 3] # [B, 3]
-    prefix = c2w.shape[:-2]
-
-    i, j = torch.meshgrid(torch.linspace(0, W-1, W, device=device), torch.linspace(0, H-1, H, device=device), indexing='ij') # for torch < 1.10, should remove indexing='ij'
-    i = i.t().reshape([*[1]*len(prefix), H*W]).expand([*prefix, H*W])
-    j = j.t().reshape([*[1]*len(prefix), H*W]).expand([*prefix, H*W])
-
-    if N_rays > 0:
-        N_rays = min(N_rays, H*W)
-        select_hs = torch.randint(0, H, size=[N_rays], device=device)
-        select_ws = torch.randint(0, W, size=[N_rays], device=device)
-        select_inds = select_hs * W + select_ws
-        select_inds = select_inds.expand([*prefix, N_rays])
-        i = torch.gather(i, -1, select_inds)
-        j = torch.gather(j, -1, select_inds)
-    else:
-        select_inds = torch.arange(H*W, device=device).expand([*prefix, H*W])
-
-    pixel_points_cam = lift(i, j, torch.ones_like(i), intrinsics=intrinsics)
-    pixel_points_cam = pixel_points_cam.transpose(-1, -2)
-
-    world_coords = torch.bmm(c2w, pixel_points_cam).transpose(-1, -2)[..., :3]
+    if center is None:
+        center = [W / 2, H / 2]
     
-    rays_d = world_coords - rays_o[..., None, :]
-    rays_d = F.normalize(rays_d, dim=-1)
+    directions = torch.stack([
+        (i - center[0]) / focal[0], 
+        (j - center[1]) / focal[1], 
+        torch.ones_like(i)], 
+    dim=-1)  # (H, W, 3)
 
-    rays_o = rays_o[..., None, :].expand_as(rays_d)
+    directions = directions / torch.norm(directions, dim=-1, keepdim=True)
 
-    return rays_o, rays_d, select_inds
+    return directions
 
+
+def get_rays(directions, c2w):
+    """
+    Get ray origin and normalized directions in world coordinate for all pixels in one image.
+    Reference: https://www.scratchapixel.com/lessons/3d-basic-rendering/
+               ray-tracing-generating-camera-rays/standard-coordinate-systems
+    Inputs:
+        directions: (H, W, 3) precomputed ray directions in camera coordinate
+        c2w: (3, 4) transformation matrix from camera coordinate to world coordinate
+    Outputs:
+        rays_o: (H*W, 3), the origin of the rays in world coordinate
+        rays_d: (H*W, 3), the normalized direction of the rays in world coordinate
+    """
+    # Rotate ray directions from camera coordinate to the world coordinate
+    rays_d = directions @ c2w[:3, :3].T  # (H, W, 3)
+    # rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+    # The origin of all rays is the camera origin in world coordinate
+    rays_o = c2w[:3, 3].expand(rays_d.shape)  # (H, W, 3)
+
+    return rays_o, rays_d
 
 def extract_fields(bound_min, bound_max, resolution, query_func):
     N = 64
@@ -182,7 +176,7 @@ class Trainer(object):
                  workspace='workspace', # workspace to save logs & ckpts
                  best_mode='min', # the smaller/larger result, the better
                  use_loss_as_metric=True, # use loss as the first metric
-                 report_metric_at_train=False, # also report metrics at training
+                 report_metric_at_train=True, # also report metrics at training
                  use_checkpoint="latest", # which ckpt to use at init time
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
@@ -248,6 +242,9 @@ class Trainer(object):
             "best_result": None,
             }
 
+        # a persistent iterator of dataloader, to support custom max_steps_per_epoch
+        self.loader = None
+
         # auto fix
         if len(metrics) == 0 or self.use_loss_as_metric:
             self.best_mode = 'min'
@@ -299,68 +296,63 @@ class Trainer(object):
     ### ------------------------------	
 
     def train_step(self, data):
-        images = data["image"] # [B, H, W, 3/4]
-        poses = data["pose"] # [B, 4, 4]
-        intrinsics = data["intrinsic"] # [B, 3, 3]
 
-        # sample rays 
-        B, H, W, C = images.shape
-        rays_o, rays_d, inds = get_rays(poses, intrinsics, H, W, self.conf['num_rays'])
-        images = torch.gather(images.reshape(B, -1, C), 1, torch.stack(C*[inds], -1)) # [B, N, 3/4]
+        rays_o = data['rays_o'] # [N, 3]
+        rays_d = data['rays_d'] # [N, 3]
+        rgbs = data['rgbs'] # [N, 3/4]
+
+        N, C = rgbs.shape
 
         # train with random background color if using alpha mixing
-        #bg_color = torch.ones(3, device=images.device) # [3], fixed white background
-        bg_color = torch.rand(3, device=images.device) # [3], frame-wise random.
+        #bg_color = torch.ones(3, device=self.device) # [3], fixed white background
+        bg_color = torch.rand(3, device=self.device) # [3], frame-wise random.
         if C == 4:
-            gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
-        else:
-            gt_rgb = images
+            rgbs = rgbs[..., :3] * rgbs[..., 3:] + bg_color * (1 - rgbs[..., 3:])
 
         outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, **self.conf)
     
         pred_rgb = outputs['rgb']
 
-        loss = self.criterion(pred_rgb, gt_rgb)
+        loss = self.criterion(pred_rgb, rgbs)
 
-        return pred_rgb, gt_rgb, loss
+        return pred_rgb, rgbs, loss
 
     def eval_step(self, data):
-        images = data["image"] # [B, H, W, 3/4]
-        poses = data["pose"] # [B, 4, 4]
-        intrinsics = data["intrinsic"] # [B, 3, 3]
 
-        # sample rays 
-        B, H, W, C = images.shape
-        rays_o, rays_d, _ = get_rays(poses, intrinsics, H, W, -1)
+        rays_o = data['rays_o'] # [B, H, W, 3]
+        rays_d = data['rays_d'] # [B, H, W, 3]
+        rgbs = data['rgbs'] # [B, H, W, 3/4]
 
-        bg_color = torch.ones(3, device=images.device) # [3]
+        B, H, W, C = rgbs.shape
+        rays_o = rays_o.view(-1, 3)
+        rays_d = rays_d.view(-1, 3)
+
         # eval with fixed background color
+        bg_color = torch.ones(3, device=self.device) # [3]
         if C == 4:
-            gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
-        else:
-            gt_rgb = images
+            rgbs = rgbs[..., :3] * rgbs[..., 3:] + bg_color * (1 - rgbs[..., 3:])
         
         outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **self.conf)
 
         pred_rgb = outputs['rgb'].reshape(B, H, W, -1)
         pred_depth = outputs['depth'].reshape(B, H, W)
 
-        loss = self.criterion(pred_rgb, gt_rgb)
+        loss = self.criterion(pred_rgb, rgbs)
 
-        return pred_rgb, pred_depth, gt_rgb, loss
+        return pred_rgb, pred_depth, rgbs, loss
 
     # moved out bg_color and perturb for more flexible control...
     def test_step(self, data, bg_color=None, perturb=False):  
-        poses = data["pose"] # [B, 4, 4]
-        intrinsics = data["intrinsic"] # [B, 3, 3]
-        H, W = int(data['H'][0]), int(data['W'][0]) # get the target size...
 
-        B = poses.shape[0]
+        rays_o = data['rays_o'] # [B, H, W, 3]
+        rays_d = data['rays_d'] # [B, H, W, 3]
+        B, H, W, _ = rays_o.shape
 
-        rays_o, rays_d, _ = get_rays(poses, intrinsics, H, W, -1)
+        rays_o = rays_o.view(-1, 3)
+        rays_d = rays_d.view(-1, 3)
 
         if bg_color is not None:
-            bg_color = bg_color.to(rays_o.device)
+            bg_color = bg_color.to(self.device)
 
         outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, **self.conf)
 
@@ -397,14 +389,17 @@ class Trainer(object):
 
     ### ------------------------------
 
-    def train(self, train_loader, valid_loader, max_epochs):
+    def train(self, train_loader, valid_loader, max_epochs, max_steps_per_epoch=-1):
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
         
+        # to support max_steps_per_epoch
+        self.loader = iter(train_loader)
+
         for epoch in range(self.epoch, max_epochs + 1):
             self.epoch = epoch
 
-            self.train_one_epoch(train_loader)
+            self.train_one_epoch(train_loader, max_steps_per_epoch)
 
             if self.workspace is not None and self.local_rank == 0:
                 self.save_checkpoint(full=True, best=False)
@@ -430,9 +425,14 @@ class Trainer(object):
         
         self.log(f"==> Start Test, save results to {save_path}")
 
-        pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+        pbar = tqdm.tqdm(total=len(loader), bar_format='{percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
         self.model.eval()
         with torch.no_grad():
+
+            if self.model.cuda_ray:
+                with torch.cuda.amp.autocast(enabled=self.fp16):
+                    self.model.update_extra_state()
+                    
             for i, data in enumerate(loader):
                 
                 data = self.prepare_data(data)
@@ -448,7 +448,7 @@ class Trainer(object):
                 cv2.imwrite(path, cv2.cvtColor((preds[0].detach().cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
                 cv2.imwrite(path_depth, (preds_depth[0].detach().cpu().numpy() * 255).astype(np.uint8))
 
-                pbar.update(loader.batch_size)
+                pbar.update(1)
 
         self.log(f"==> Finished Test.")
     
@@ -464,16 +464,18 @@ class Trainer(object):
 
         total_loss = torch.tensor([0], dtype=torch.float32, device=self.device)
         
-        loader = iter(train_loader)
+        # may cause a very slow starting...
+        if self.loader is None:
+            self.loader = iter(train_loader)
 
         for _ in range(step):
             
             # mimic an infinite loop dataloader (in case the total dataset is smaller than step)
             try:
-                data = next(loader)
+                data = next(self.loader)
             except StopIteration:
-                loader = iter(train_loader)
-                data = next(loader)
+                self.loader = iter(train_loader)
+                data = next(self.loader)
             
             self.global_step += 1
             
@@ -513,13 +515,11 @@ class Trainer(object):
 
     
     # [GUI] test on a single image
-    def test_gui(self, pose, intrinsics, W, H, bg_color=None, spp=1):
-
+    def test_gui(self, rays_o, rays_d, bg_color=None, spp=1):
+        
         data = {
-            'pose': pose[None, :],
-            'intrinsic': intrinsics[None, :],
-            'H': [str(H)],
-            'W': [str(W)],
+            'rays_o': rays_o.unsqueeze(0),
+            'rays_d': rays_d.unsqueeze(0),
         }
 
         data = self.prepare_data(data)
@@ -565,7 +565,7 @@ class Trainer(object):
 
         return data
 
-    def train_one_epoch(self, loader):
+    def train_one_epoch(self, train_loader, max_steps_per_epoch=-1):
         self.log(f"==> Start Training Epoch {self.epoch}, lr={self.optimizer.param_groups[0]['lr']:.6f} ...")
 
         total_loss = 0
@@ -583,15 +583,28 @@ class Trainer(object):
         # distributedSampler: must call set_epoch() to shuffle indices across multiple epochs
         # ref: https://pytorch.org/docs/stable/data.html
         if self.world_size > 1:
-            loader.sampler.set_epoch(self.epoch)
+            train_loader.sampler.set_epoch(self.epoch)
+
+        if max_steps_per_epoch == -1:
+            max_steps_per_epoch = len(train_loader)
         
         if self.local_rank == 0:
-            pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+            pbar = tqdm.tqdm(total=max_steps_per_epoch, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
 
         self.local_step = 0
 
-        for data in loader:
+        for _ in range(max_steps_per_epoch):
             
+            # mimic an infinite loop dataloader (in case the total dataset is smaller than step)
+            try:
+                data = next(self.loader)
+            except StopIteration:
+                self.loader = iter(train_loader)
+                data = next(self.loader)
+
+            if self.local_step >= max_steps_per_epoch:
+                break
+
             self.local_step += 1
             self.global_step += 1
             
@@ -625,7 +638,7 @@ class Trainer(object):
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
                 else:
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
-                pbar.update(loader.batch_size)
+                pbar.update(1)
 
         if self.ema is not None:
             self.ema.update()
@@ -666,10 +679,15 @@ class Trainer(object):
             self.ema.copy_to()
 
         if self.local_rank == 0:
-            pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+            pbar = tqdm.tqdm(total=len(loader), bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
 
         with torch.no_grad():
             self.local_step = 0
+
+            if self.model.cuda_ray:
+                with torch.cuda.amp.autocast(enabled=self.fp16):
+                    self.model.update_extra_state()
+
             for data in loader:    
                 self.local_step += 1
                 
@@ -717,7 +735,7 @@ class Trainer(object):
                     #cv2.imwrite(save_path_gt, cv2.cvtColor((truths[0].detach().cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
 
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
-                    pbar.update(loader.batch_size)
+                    pbar.update(1)
 
 
         average_loss = total_loss / self.local_step
@@ -796,6 +814,7 @@ class Trainer(object):
                 self.log(f"[WARN] no evaluated results found, skip saving best checkpoint.")
             
     def load_checkpoint(self, checkpoint=None):
+        
         if checkpoint is None:
             checkpoint_list = sorted(glob.glob(f'{self.ckpt_path}/{self.name}_ep*.pth.tar'))
             if checkpoint_list:
