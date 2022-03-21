@@ -86,6 +86,7 @@ def get_rays(directions, c2w):
 
     return rays_o, rays_d
 
+
 def extract_fields(bound_min, bound_max, resolution, query_func):
     N = 64
     X = torch.linspace(bound_min[0], bound_max[0], resolution).split(N)
@@ -155,6 +156,25 @@ class PSNRMeter:
     def report(self):
         return f'PSNR = {self.measure():.6f}'
 
+def N_to_reso(n_voxels, bbox):
+    xyz_min, xyz_max = bbox
+    voxel_size = ((xyz_max - xyz_min).prod() / n_voxels).pow(1 / 3)
+    return ((xyz_max - xyz_min) / voxel_size).long().tolist()
+
+def cal_n_samples(reso, step_ratio=0.5):
+    return int(np.linalg.norm(reso)/step_ratio)
+
+def renderer(rays, tensorf, chunk=4096, N_samples=-1, ndc_ray=False, white_bg=True, is_train=False, device='cuda'):
+    rgbs, alphas, depth_maps, weights, uncertainties = [], [], [], [], []
+    N_rays_all = rays.shape[0]
+
+    for chunk_idx in range(N_rays_all // chunk + int(N_rays_all % chunk > 0)):
+        rays_chunk = rays[chunk_idx * chunk:(chunk_idx + 1) * chunk].to(device)
+        rgb_map, depth_map = tensorf(rays_chunk, is_train=is_train, white_bg=white_bg, ndc_ray=ndc_ray, N_samples=N_samples)
+        rgbs.append(rgb_map)
+        depth_maps.append(depth_map)
+    
+    return torch.cat(rgbs), torch.cat(depth_maps)
 
 class Trainer(object):
     def __init__(self, 
@@ -176,7 +196,7 @@ class Trainer(object):
                  workspace='workspace', # workspace to save logs & ckpts
                  best_mode='min', # the smaller/larger result, the better
                  use_loss_as_metric=True, # use loss as the first metric
-                 report_metric_at_train=False, # also report metrics at training
+                 report_metric_at_train=True, # also report metrics at training
                  use_checkpoint="latest", # which ckpt to use at init time
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
@@ -216,11 +236,13 @@ class Trainer(object):
         if optimizer is None:
             self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=5e-4) # naive adam
         else:
+            self.optimizer_fn = optimizer
             self.optimizer = optimizer(self.model)
 
         if lr_scheduler is None:
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1) # fake scheduler
         else:
+            self.lr_scheduler_fn = lr_scheduler
             self.lr_scheduler = lr_scheduler(self.optimizer)
 
         if ema_decay is not None:
@@ -241,7 +263,7 @@ class Trainer(object):
             "checkpoints": [], # record path of saved ckpt, to automatically remove old ckpt
             "best_result": None,
             }
-
+        
         # a persistent iterator of dataloader, to support custom max_steps_per_epoch
         self.loader = None
 
@@ -296,46 +318,49 @@ class Trainer(object):
     ### ------------------------------	
 
     def train_step(self, data):
-
-        rays_o = data['rays_o'] # [N, 3]
-        rays_d = data['rays_d'] # [N, 3]
+        
+        rays = data['rays'] # [N, 6]
         rgbs = data['rgbs'] # [N, 3/4]
 
         N, C = rgbs.shape
 
         # train with random background color if using alpha mixing
-        #bg_color = torch.ones(3, device=self.device) # [3], fixed white background
-        bg_color = torch.rand(3, device=self.device) # [3], frame-wise random.
+        bg_color = torch.ones(3, device=self.device) # [3], fixed white background
+        #bg_color = torch.rand(3, device=self.device) # [3], frame-wise random.
+
         if C == 4:
             rgbs = rgbs[..., :3] * rgbs[..., 3:] + bg_color * (1 - rgbs[..., 3:])
-
-        outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, **self.conf)
-    
-        pred_rgb = outputs['rgb']
+        
+        pred_rgb, pred_depth = renderer(rays, self.model, chunk=self.conf['num_rays'], N_samples=self.nSamples, white_bg=True, ndc_ray=False, device=self.device, is_train=True)
 
         loss = self.criterion(pred_rgb, rgbs)
+
+        # l1 reg
+        loss += self.model.density_L1() * self.L1_reg_weight
 
         return pred_rgb, rgbs, loss
 
     def eval_step(self, data):
 
-        rays_o = data['rays_o'] # [B, H, W, 3]
-        rays_d = data['rays_d'] # [B, H, W, 3]
+        rays = data['rays'] # [B, H, W, 6]
         rgbs = data['rgbs'] # [B, H, W, 3/4]
 
         B, H, W, C = rgbs.shape
-        rays_o = rays_o.view(-1, 3)
-        rays_d = rays_d.view(-1, 3)
+        rays = rays.view(-1, 6)
 
         # eval with fixed background color
         bg_color = torch.ones(3, device=self.device) # [3]
+
         if C == 4:
             rgbs = rgbs[..., :3] * rgbs[..., 3:] + bg_color * (1 - rgbs[..., 3:])
         
-        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **self.conf)
+        pred_rgb, pred_depth = renderer(rays, self.model, chunk=self.conf['num_rays'], N_samples=self.nSamples, white_bg=True, ndc_ray=False, device=self.device, is_train=False)
 
-        pred_rgb = outputs['rgb'].reshape(B, H, W, -1)
-        pred_depth = outputs['depth'].reshape(B, H, W)
+        pred_rgb = pred_rgb.reshape(B, H, W, -1)
+        pred_depth = pred_depth.reshape(B, H, W)
+
+        # normalize depth
+        pred_depth = (pred_depth - self.near_far[0]) / (self.near_far[1] - self.near_far[0] + 1e-8)
 
         loss = self.criterion(pred_rgb, rgbs)
 
@@ -344,20 +369,18 @@ class Trainer(object):
     # moved out bg_color and perturb for more flexible control...
     def test_step(self, data, bg_color=None, perturb=False):  
 
-        rays_o = data['rays_o'] # [B, H, W, 3]
-        rays_d = data['rays_d'] # [B, H, W, 3]
-        B, H, W, _ = rays_o.shape
+        rays = data['rays'] # [B, H, W, 6]
+        B, H, W, _ = rays.shape
 
-        rays_o = rays_o.view(-1, 3)
-        rays_d = rays_d.view(-1, 3)
+        rays = rays.view(-1, 6)
+        
+        pred_rgb, pred_depth = renderer(rays, self.model, chunk=self.conf['num_rays'], N_samples=self.nSamples, white_bg=True, ndc_ray=False, device=self.device, is_train=False)
 
-        if bg_color is not None:
-            bg_color = bg_color.to(self.device)
+        pred_rgb = pred_rgb.reshape(B, H, W, -1)
+        pred_depth = pred_depth.reshape(B, H, W)
 
-        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, **self.conf)
-
-        pred_rgb = outputs['rgb'].reshape(B, H, W, -1)
-        pred_depth = outputs['depth'].reshape(B, H, W)
+        # normalize depth
+        pred_depth = (pred_depth - self.near_far[0]) / (self.near_far[1] - self.near_far[0] + 1e-8)
 
         return pred_rgb, pred_depth
 
@@ -392,10 +415,10 @@ class Trainer(object):
     def train(self, train_loader, valid_loader, max_epochs, max_steps_per_epoch=-1):
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
-        
+
         # to support max_steps_per_epoch
         self.loader = iter(train_loader)
-
+        
         for epoch in range(self.epoch, max_epochs + 1):
             self.epoch = epoch
 
@@ -428,10 +451,6 @@ class Trainer(object):
         pbar = tqdm.tqdm(total=len(loader), bar_format='{percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
         self.model.eval()
         with torch.no_grad():
-
-            if self.model.cuda_ray:
-                with torch.cuda.amp.autocast(enabled=self.fp16):
-                    self.model.update_extra_state()
                     
             for i, data in enumerate(loader):
                 
@@ -464,7 +483,6 @@ class Trainer(object):
 
         total_loss = torch.tensor([0], dtype=torch.float32, device=self.device)
         
-        # may cause a very slow starting...
         if self.loader is None:
             self.loader = iter(train_loader)
 
@@ -515,11 +533,13 @@ class Trainer(object):
 
     
     # [GUI] test on a single image
-    def test_gui(self, rays_o, rays_d, bg_color=None, spp=1):
-        
+    def test_gui(self, pose, intrinsics, W, H, bg_color=None, spp=1):
+
         data = {
-            'rays_o': rays_o.unsqueeze(0),
-            'rays_d': rays_d.unsqueeze(0),
+            'pose': pose[None, :],
+            'intrinsic': intrinsics[None, :],
+            'H': [str(H)],
+            'W': [str(W)],
         }
 
         data = self.prepare_data(data)
@@ -575,11 +595,6 @@ class Trainer(object):
 
         self.model.train()
 
-        # update grid
-        if self.model.cuda_ray:
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                self.model.update_extra_state()
-
         # distributedSampler: must call set_epoch() to shuffle indices across multiple epochs
         # ref: https://pytorch.org/docs/stable/data.html
         if self.world_size > 1:
@@ -604,7 +619,7 @@ class Trainer(object):
 
             if self.local_step >= max_steps_per_epoch:
                 break
-
+            
             self.local_step += 1
             self.global_step += 1
             
@@ -639,6 +654,50 @@ class Trainer(object):
                 else:
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
                 pbar.update(1)
+            
+            # tensoRF upsampling
+            if self.global_step in self.conf['update_AlphaMask_list']:
+
+                self.log(f"[INFO] update alphamask at step {self.global_step}")
+
+                if self.reso_cur[0] * self.reso_cur[1] * self.reso_cur[2] < 256**3:# update volume resolution
+                    reso_mask = self.reso_cur
+
+                new_aabb = self.model.updateAlphaMask(tuple(reso_mask))
+                
+                if self.global_step == self.conf['update_AlphaMask_list'][0]:
+                    self.model.shrink(new_aabb) # will update self.model.aabb
+                    # tensorVM.alphaMask = None
+                    self.L1_reg_weight = self.conf['L1_weight_rest']
+                    #self.log(f"[INFO] new aabb {self.model.aabb}")
+
+                # if not self.conf.ndc_ray and self.global_step == self.conf['update_AlphaMask_list'][1]:
+                #     # filter rays outside the bbox
+                #     allrays,allrgbs = self.model.filtering_rays(allrays,allrgbs)
+                #     trainingSampler = SimpleSampler(allrgbs.shape[0], self.conf.batch_size)
+
+
+            if self.global_step in self.conf['upsamp_list']:
+
+                self.log(f"[INFO] upsample at step {self.global_step}")
+
+                n_voxels = self.N_voxel_list.pop(0)
+                self.reso_cur = N_to_reso(n_voxels, self.model.aabb)
+                self.nSamples = min(self.conf['nSamples'], cal_n_samples(self.reso_cur, self.conf['step_ratio']))
+                self.model.upsample_volume_grid(self.reso_cur)
+
+                #self.log(f"[INFO] reso {self.reso_cur}, nsamples {self.nSamples}")
+
+                # if self.conf['lr_upsample_reset']:
+                #     print("reset lr to initial")
+                #     lr_scale = 1 #0.1 ** (self.global_step / self.conf.n_iters)
+                # else:
+                #     lr_scale = self.conf.lr_decay_target_ratio ** (iteration / self.conf.n_iters)
+                
+                # re-init optimizer since model params are changed!
+                # also reset LR.
+                self.optimizer = self.optimizer_fn(self.model)
+                self.lr_scheduler = self.lr_scheduler_fn(self.optimizer)
 
         if self.ema is not None:
             self.ema.update()
@@ -683,10 +742,6 @@ class Trainer(object):
 
         with torch.no_grad():
             self.local_step = 0
-
-            if self.model.cuda_ray:
-                with torch.cuda.amp.autocast(enabled=self.fp16):
-                    self.model.update_extra_state()
 
             for data in loader:    
                 self.local_step += 1
@@ -767,10 +822,6 @@ class Trainer(object):
             'stats': self.stats,
         }
 
-        if self.model.cuda_ray:
-            state['mean_count'] = self.model.mean_count
-            state['mean_density'] = self.model.mean_density
-
         if full:
             state['optimizer'] = self.optimizer.state_dict()
             state['lr_scheduler'] = self.lr_scheduler.state_dict()
@@ -780,7 +831,7 @@ class Trainer(object):
         
         if not best:
 
-            state['model'] = self.model.state_dict()
+            state['model'] = self.model.get_state_dict()
 
             file_path = f"{self.ckpt_path}/{self.name}_ep{self.epoch:04d}.pth.tar"
 
@@ -804,7 +855,7 @@ class Trainer(object):
                         self.ema.store()
                         self.ema.copy_to()
 
-                    state['model'] = self.model.state_dict()
+                    state['model'] = self.model.get_state_dict()
 
                     if self.ema is not None:
                         self.ema.restore()
@@ -814,7 +865,7 @@ class Trainer(object):
                 self.log(f"[WARN] no evaluated results found, skip saving best checkpoint.")
             
     def load_checkpoint(self, checkpoint=None):
-        
+
         if checkpoint is None:
             checkpoint_list = sorted(glob.glob(f'{self.ckpt_path}/{self.name}_ep*.pth.tar'))
             if checkpoint_list:
@@ -827,16 +878,26 @@ class Trainer(object):
         checkpoint_dict = torch.load(checkpoint, map_location=self.device)
         
         if 'model' not in checkpoint_dict:
-            self.model.load_state_dict(checkpoint_dict)
+            
+            # need to re-create the model !!! and re-create optimizer & scheduler...
+            kwargs = checkpoint_dict['kwargs']
+            kwargs.update({'device': self.device})
+            self.model = self.model.__class__(**kwargs)
+            self.optimizer = self.optimizer_fn(self.model)
+            self.lr_scheduler = self.lr_scheduler_fn(self.optimizer)
+
+            self.model.load(checkpoint_dict)
             self.log("[INFO] loaded model.")
             return
+        
+        kwargs = checkpoint_dict['model']['kwargs']
+        kwargs.update({'device': self.device})
+        self.model = self.model.__class__(**kwargs)
+        self.optimizer = self.optimizer_fn(self.model)
+        self.lr_scheduler = self.lr_scheduler_fn(self.optimizer)
 
-        missing_keys, unexpected_keys = self.model.load_state_dict(checkpoint_dict['model'], strict=False)
+        self.model.load(checkpoint_dict['model'])
         self.log("[INFO] loaded model.")
-        if len(missing_keys) > 0:
-            self.log(f"[WARN] missing keys: {missing_keys}")
-        if len(unexpected_keys) > 0:
-            self.log(f"[WARN] unexpected keys: {unexpected_keys}")   
 
         if self.ema is not None and 'ema' in checkpoint_dict:
             self.ema.load_state_dict(checkpoint_dict['ema'])
@@ -844,12 +905,6 @@ class Trainer(object):
         self.stats = checkpoint_dict['stats']
         self.epoch = checkpoint_dict['epoch']
 
-        if self.model.cuda_ray:
-            if 'mean_count' in checkpoint_dict:
-                self.model.mean_count = checkpoint_dict['mean_count']
-            if 'mean_density' in checkpoint_dict:
-                self.model.mean_density = checkpoint_dict['mean_density']
-        
         if self.optimizer and  'optimizer' in checkpoint_dict:
             try:
                 self.optimizer.load_state_dict(checkpoint_dict['optimizer'])

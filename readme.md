@@ -107,6 +107,7 @@ check the `scripts` directory for more provided examples.
 * 3.21: lots of modifications to improve PSNR, now we can reach ~33 for the LEGO dataset.
     * enhanced data provider (random sample rays from all training images, and pre-generate rays)
     * ported parts of TensoRF for comparison (not fully supported!).
+    * known issue: pre-generating rays consumes much more CPU memory at starting. Shuffle of such a large dataset can be very slow. Dataloader needs more num_workers to keep the speed, but still sometimes unstable.
 * 3.14: fixed the precision related issue for `fp16` mode, and it renders much better quality. Added PSNR metric for NeRF.
 * 3.14: linearly scale `desired_resolution` with `bound` according to https://github.com/ashawkey/torch-ngp/issues/23.
     * known issue: very large bound (e.g., 16) leads to bad performance. Better to scale down the camera to fit into a smaller bounding box.

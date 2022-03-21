@@ -96,23 +96,18 @@ if __name__ == '__main__':
         # need different dataset type for GUI/CMD mode.
 
         if opt.gui:
-            train_dataset = NeRFDataset(opt.path, type='all', mode=opt.mode, scale=opt.scale, preload=opt.preload)
-            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.num_rays, shuffle=True, num_workers=4, pin_memory=True)
+            train_dataset = NeRFDataset(opt.path, type='train', mode=opt.mode, scale=opt.scale, preload=opt.preload)
+            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.num_rays, shuffle=True, num_workers=8, pin_memory=True)
             # attach dataloader to trainer
             trainer.train_loader = train_loader 
-
-            import time
-            print(len(train_dataset))
-            _t = time.time()
-            trainer.loader = iter(train_loader)
-            print(f'[iter] {time.time() - _t:.6f}')
+            trainer.loader = iter(train_loader) # very slow, can take ~10s to shuffle...
 
             gui = NeRFGUI(opt, trainer)
             gui.render()
         
         else:
             train_dataset = NeRFDataset(opt.path, type='train', mode=opt.mode, scale=opt.scale, preload=opt.preload)
-            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.num_rays, shuffle=True, num_workers=4, pin_memory=True)
+            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.num_rays, shuffle=True, num_workers=8, pin_memory=True)
             valid_dataset = NeRFDataset(opt.path, type='val', mode=opt.mode, downscale=2, scale=opt.scale, preload=opt.preload)
             valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1, pin_memory=True)
 
