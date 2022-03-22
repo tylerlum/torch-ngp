@@ -1,3 +1,4 @@
+import argparse
 import os
 import glob
 import tqdm
@@ -39,7 +40,7 @@ def seed_everything(seed):
 def lift(x, y, z, intrinsics):
     # x, y, z: [B, N]
     # intrinsics: [B, 3, 3]
-    
+
     fx = intrinsics[..., 0, 0].unsqueeze(-1)
     fy = intrinsics[..., 1, 1].unsqueeze(-1)
     cx = intrinsics[..., 0, 2].unsqueeze(-1)
@@ -83,7 +84,7 @@ def get_rays(c2w, intrinsics, H, W, N_rays=-1):
     pixel_points_cam = pixel_points_cam.transpose(-1, -2)
 
     world_coords = torch.bmm(c2w, pixel_points_cam).transpose(-1, -2)[..., :3]
-    
+
     rays_d = world_coords - rays_o[..., None, :]
     rays_d = F.normalize(rays_d, dim=-1)
 
@@ -115,7 +116,7 @@ def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
     u = extract_fields(bound_min, bound_max, resolution, query_func)
 
     #print(u.shape, u.max(), u.min(), np.percentile(u, 50))
-    
+
     vertices, triangles = mcubes.marching_cubes(u, threshold)
 
     b_max_np = bound_max.detach().cpu().numpy()
@@ -145,10 +146,10 @@ class PSNRMeter:
 
     def update(self, preds, truths):
         preds, truths = self.prepare_inputs(preds, truths) # [B, N, 3] or [B, H, W, 3], range[0, 1]
-          
+
         # simplified since max_pixel_value is 1 here.
         psnr = -10 * np.log10(np.mean(np.power(preds - truths, 2)))
-        
+
         self.V += psnr
         self.N += 1
 
@@ -163,10 +164,10 @@ class PSNRMeter:
 
 
 class Trainer(object):
-    def __init__(self, 
+    def __init__(self,
                  name, # name of this experiment
                  conf, # extra conf
-                 model, # network 
+                 model, # network
                  criterion=None, # loss function, if None, assume inline implementation in train_step
                  optimizer=None, # optimizer
                  ema_decay=None, # if use EMA, set the decay
@@ -187,7 +188,7 @@ class Trainer(object):
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
                  ):
-        
+
         self.name = name
         self.conf = conf
         self.mute = mute
@@ -255,14 +256,14 @@ class Trainer(object):
         # workspace prepare
         self.log_ptr = None
         if self.workspace is not None:
-            os.makedirs(self.workspace, exist_ok=True)        
+            os.makedirs(self.workspace, exist_ok=True)
             self.log_path = os.path.join(workspace, f"log_{self.name}.txt")
             self.log_ptr = open(self.log_path, "a+")
 
             self.ckpt_path = os.path.join(self.workspace, 'checkpoints')
             self.best_path = f"{self.ckpt_path}/{self.name}.pth.tar"
             os.makedirs(self.ckpt_path, exist_ok=True)
-            
+
         self.log(f'[INFO] Trainer: {self.name} | {self.time_stamp} | {self.device} | {"fp16" if self.fp16 else "fp32"} | {self.workspace}')
         self.log(f'[INFO] #parameters: {sum([p.numel() for p in model.parameters() if p.requires_grad])}')
 
@@ -284,26 +285,26 @@ class Trainer(object):
                 self.load_checkpoint(self.use_checkpoint)
 
     def __del__(self):
-        if self.log_ptr: 
+        if self.log_ptr:
             self.log_ptr.close()
 
     def log(self, *args, **kwargs):
         if self.local_rank == 0:
-            if not self.mute: 
+            if not self.mute:
                 #print(*args)
                 self.console.print(*args, **kwargs)
-            if self.log_ptr: 
+            if self.log_ptr:
                 print(*args, file=self.log_ptr)
                 self.log_ptr.flush() # write immediately to file
 
-    ### ------------------------------	
+    ### ------------------------------
 
     def train_step(self, data):
         images = data["image"] # [B, H, W, 3/4]
         poses = data["pose"] # [B, 4, 4]
         intrinsics = data["intrinsic"] # [B, 3, 3]
 
-        # sample rays 
+        # sample rays
         B, H, W, C = images.shape
         rays_o, rays_d, inds = get_rays(poses, intrinsics, H, W, self.conf['num_rays'])
         images = torch.gather(images.reshape(B, -1, C), 1, torch.stack(C*[inds], -1)) # [B, N, 3/4]
@@ -317,7 +318,7 @@ class Trainer(object):
             gt_rgb = images
 
         outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, **self.conf)
-    
+
         pred_rgb = outputs['rgb']
 
         loss = self.criterion(pred_rgb, gt_rgb)
@@ -329,7 +330,7 @@ class Trainer(object):
         poses = data["pose"] # [B, 4, 4]
         intrinsics = data["intrinsic"] # [B, 3, 3]
 
-        # sample rays 
+        # sample rays
         B, H, W, C = images.shape
         rays_o, rays_d, _ = get_rays(poses, intrinsics, H, W, -1)
 
@@ -339,7 +340,7 @@ class Trainer(object):
             gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
         else:
             gt_rgb = images
-        
+
         outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **self.conf)
 
         pred_rgb = outputs['rgb'].reshape(B, H, W, -1)
@@ -350,7 +351,7 @@ class Trainer(object):
         return pred_rgb, pred_depth, gt_rgb, loss
 
     # moved out bg_color and perturb for more flexible control...
-    def test_step(self, data, bg_color=None, perturb=False):  
+    def test_step(self, data, bg_color=None, perturb=False):
         poses = data["pose"] # [B, 4, 4]
         intrinsics = data["intrinsic"] # [B, 3, 3]
         H, W = int(data['H'][0]), int(data['W'][0]) # get the target size...
@@ -400,7 +401,7 @@ class Trainer(object):
     def train(self, train_loader, valid_loader, max_epochs):
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
-        
+
         for epoch in range(self.epoch, max_epochs + 1):
             self.epoch = epoch
 
@@ -427,19 +428,19 @@ class Trainer(object):
             save_path = os.path.join(self.workspace, 'results')
 
         os.makedirs(save_path, exist_ok=True)
-        
+
         self.log(f"==> Start Test, save results to {save_path}")
 
         pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
         self.model.eval()
         with torch.no_grad():
             for i, data in enumerate(loader):
-                
+
                 data = self.prepare_data(data)
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth = self.test_step(data)                
-                
+                    preds, preds_depth = self.test_step(data)
+
                 path = os.path.join(save_path, f'{i:04d}.png')
                 path_depth = os.path.join(save_path, f'{i:04d}_depth.png')
 
@@ -451,7 +452,7 @@ class Trainer(object):
                 pbar.update(loader.batch_size)
 
         self.log(f"==> Finished Test.")
-    
+
     # [GUI] just train for 16 steps, without any other overhead that may slow down rendering.
     def train_gui(self, train_loader, step=16):
 
@@ -463,31 +464,31 @@ class Trainer(object):
                 self.model.update_extra_state()
 
         total_loss = torch.tensor([0], dtype=torch.float32, device=self.device)
-        
+
         loader = iter(train_loader)
 
         for _ in range(step):
-            
+
             # mimic an infinite loop dataloader (in case the total dataset is smaller than step)
             try:
                 data = next(loader)
             except StopIteration:
                 loader = iter(train_loader)
                 data = next(loader)
-            
+
             self.global_step += 1
-            
+
             data = self.prepare_data(data)
 
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 preds, truths, loss = self.train_step(data)
-         
+
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
-            
+
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()
 
@@ -508,10 +509,10 @@ class Trainer(object):
             'loss': average_loss,
             'lr': self.optimizer.param_groups[0]['lr'],
         }
-        
+
         return outputs
 
-    
+
     # [GUI] test on a single image
     def test_gui(self, pose, intrinsics, W, H, bg_color=None, spp=1):
 
@@ -523,7 +524,7 @@ class Trainer(object):
         }
 
         data = self.prepare_data(data)
-        
+
         self.model.eval()
 
         if self.ema is not None:
@@ -584,24 +585,24 @@ class Trainer(object):
         # ref: https://pytorch.org/docs/stable/data.html
         if self.world_size > 1:
             loader.sampler.set_epoch(self.epoch)
-        
+
         if self.local_rank == 0:
             pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
 
         self.local_step = 0
 
         for data in loader:
-            
+
             self.local_step += 1
             self.global_step += 1
-            
+
             data = self.prepare_data(data)
 
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 preds, truths, loss = self.train_step(data)
-         
+
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -616,7 +617,7 @@ class Trainer(object):
                 if self.report_metric_at_train:
                     for metric in self.metrics:
                         metric.update(preds, truths)
-                        
+
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
@@ -670,9 +671,9 @@ class Trainer(object):
 
         with torch.no_grad():
             self.local_step = 0
-            for data in loader:    
+            for data in loader:
                 self.local_step += 1
-                
+
                 data = self.prepare_data(data)
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
@@ -683,7 +684,7 @@ class Trainer(object):
                 if self.world_size > 1:
                     dist.all_reduce(loss, op=dist.ReduceOp.SUM)
                     loss = loss / self.world_size
-                    
+
                     preds_list = [torch.zeros_like(preds).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
                     dist.all_gather(preds_list, preds)
                     preds = torch.cat(preds_list, dim=0)
@@ -695,7 +696,7 @@ class Trainer(object):
                     truths_list = [torch.zeros_like(truths).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
                     dist.all_gather(truths_list, truths)
                     truths = torch.cat(truths_list, dim=0)
-                
+
                 loss_val = loss.item()
                 total_loss += loss_val
 
@@ -759,7 +760,7 @@ class Trainer(object):
             state['scaler'] = self.scaler.state_dict()
             if self.ema is not None:
                 state['ema'] = self.ema.state_dict()
-        
+
         if not best:
 
             state['model'] = self.model.state_dict()
@@ -775,13 +776,13 @@ class Trainer(object):
 
             torch.save(state, file_path)
 
-        else:    
+        else:
             if len(self.stats["results"]) > 0:
                 if self.stats["best_result"] is None or self.stats["results"][-1] < self.stats["best_result"]:
                     self.log(f"[INFO] New best result: {self.stats['best_result']} --> {self.stats['results'][-1]}")
                     self.stats["best_result"] = self.stats["results"][-1]
 
-                    # save ema results 
+                    # save ema results
                     if self.ema is not None:
                         self.ema.store()
                         self.ema.copy_to()
@@ -790,11 +791,11 @@ class Trainer(object):
 
                     if self.ema is not None:
                         self.ema.restore()
-                    
+
                     torch.save(state, self.best_path)
             else:
                 self.log(f"[WARN] no evaluated results found, skip saving best checkpoint.")
-            
+
     def load_checkpoint(self, checkpoint=None):
         if checkpoint is None:
             checkpoint_list = sorted(glob.glob(f'{self.ckpt_path}/{self.name}_ep*.pth.tar'))
@@ -806,7 +807,7 @@ class Trainer(object):
                 return
 
         checkpoint_dict = torch.load(checkpoint, map_location=self.device)
-        
+
         if 'model' not in checkpoint_dict:
             self.model.load_state_dict(checkpoint_dict)
             self.log("[INFO] loaded model.")
@@ -817,7 +818,7 @@ class Trainer(object):
         if len(missing_keys) > 0:
             self.log(f"[WARN] missing keys: {missing_keys}")
         if len(unexpected_keys) > 0:
-            self.log(f"[WARN] unexpected keys: {unexpected_keys}")   
+            self.log(f"[WARN] unexpected keys: {unexpected_keys}")
 
         if self.ema is not None and 'ema' in checkpoint_dict:
             self.ema.load_state_dict(checkpoint_dict['ema'])
@@ -830,14 +831,14 @@ class Trainer(object):
                 self.model.mean_count = checkpoint_dict['mean_count']
             if 'mean_density' in checkpoint_dict:
                 self.model.mean_density = checkpoint_dict['mean_density']
-        
+
         if self.optimizer and  'optimizer' in checkpoint_dict:
             try:
                 self.optimizer.load_state_dict(checkpoint_dict['optimizer'])
                 self.log("[INFO] loaded optimizer.")
             except:
                 self.log("[WARN] Failed to load optimizer, use default.")
-        
+
         # strange bug: keyerror 'lr_lambdas'
         if self.lr_scheduler and 'lr_scheduler' in checkpoint_dict:
             try:
@@ -845,10 +846,43 @@ class Trainer(object):
                 self.log("[INFO] loaded scheduler.")
             except:
                 self.log("[WARN] Failed to load scheduler, use default.")
-        
+
         if 'scaler' in checkpoint_dict:
             try:
                 self.scaler.load_state_dict(checkpoint_dict['scaler'])
                 self.log("[INFO] loaded scaler.")
             except:
                 self.log("[WARN] Failed to load scaler, use default.")
+
+def get_config_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('path', type=str)
+    parser.add_argument('--test', action='store_true', help="test mode")
+    parser.add_argument('--workspace', type=str, default='workspace')
+    parser.add_argument('--seed', type=int, default=0)
+    ### training options
+    parser.add_argument('--num_rays', type=int, default=4096)
+    parser.add_argument('--cuda_ray', action='store_true', help="use CUDA raymarching instead of pytorch")
+    # (only valid when not using --cuda_ray)
+    parser.add_argument('--num_steps', type=int, default=128)
+    parser.add_argument('--upsample_steps', type=int, default=128)
+    parser.add_argument('--max_ray_batch', type=int, default=4096)
+    ### network backbone options
+    parser.add_argument('--fp16', action='store_true', help="use amp mixed precision training")
+    parser.add_argument('--ff', action='store_true', help="use fully-fused MLP")
+    parser.add_argument('--tcnn', action='store_true', help="use TCNN backend")
+    ### dataset options
+    parser.add_argument('--mode', type=str, default='colmap', help="dataset mode, supports (colmap, blender)")
+    parser.add_argument('--preload', action='store_true', help="preload all data into GPU, fasten training but use more GPU memory")
+    # (default is for the fox dataset)
+    parser.add_argument('--bound', type=float, default=2, help="assume the scene is bounded in box(-bound, bound)")
+    parser.add_argument('--scale', type=float, default=0.33, help="scale camera location into box(-bound, bound)")
+    ### GUI options
+    parser.add_argument('--gui', action='store_true', help="start a GUI")
+    parser.add_argument('--W', type=int, default=800, help="GUI width")
+    parser.add_argument('--H', type=int, default=800, help="GUI height")
+    parser.add_argument('--radius', type=float, default=5, help="default GUI camera radius from center")
+    parser.add_argument('--fovy', type=float, default=90, help="default GUI camera fovy")
+    parser.add_argument('--max_spp', type=int, default=64, help="GUI rendering max sample per pixel")
+
+    return parser
