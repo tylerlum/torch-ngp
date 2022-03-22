@@ -18,18 +18,20 @@ if __name__ == '__main__':
         assert opt.fp16, "fully-fused mode must be used with fp16 mode"
         from nerf.network_ff import NeRFNetwork
     elif opt.tcnn:
+        assert opt.fp16, "tcnn mode must be used with fp16 mode"
         from nerf.network_tcnn import NeRFNetwork
     else:
         from nerf.network import NeRFNetwork
 
     model = NeRFNetwork(
+        #encoding="frequency", encoding_dir="frequency", num_layers=4, hidden_dim=256, geo_feat_dim=256, num_layers_color=4, hidden_dim_color=128,
         bound=opt.bound,
         cuda_ray=opt.cuda_ray,
     )
 
     print(model)
 
-    criterion = torch.nn.HuberLoss(delta=0.1)
+    criterion = torch.nn.MSELoss() # HuberLoss(delta=0.1)
 
     ### test mode
     if opt.test:
@@ -57,32 +59,34 @@ if __name__ == '__main__':
         ], lr=1e-2, betas=(0.9, 0.99), eps=1e-15)
 
         # need different milestones for GUI/CMD mode.
-        scheduler = lambda optimizer: optim.lr_scheduler.MultiStepLR(optimizer, milestones=[1000, 1500, 2000] if opt.gui else [50, 100, 150], gamma=0.33)
+        scheduler = lambda optimizer: optim.lr_scheduler.MultiStepLR(optimizer, milestones=[625, 1000] if opt.gui else [100, 150], gamma=0.33)
 
-        trainer = Trainer('ngp', vars(opt), model, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, metrics=[PSNRMeter()], use_checkpoint='latest', eval_interval=10)
+        trainer = Trainer('ngp', vars(opt), model, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, metrics=[PSNRMeter()], use_checkpoint='latest', eval_interval=50)
 
         # need different dataset type for GUI/CMD mode.
 
         if opt.gui:
-            train_dataset = NeRFDataset(opt.path, type='all', mode=opt.mode, scale=opt.scale, preload=opt.preload)
-            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
-            trainer.train_loader = train_loader # attach dataloader to trainer
+            train_dataset = NeRFDataset(opt.path, type='train', mode=opt.mode, scale=opt.scale, preload=opt.preload)
+            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.num_rays, shuffle=True, num_workers=8, pin_memory=True)
+            # attach dataloader to trainer
+            trainer.train_loader = train_loader
+            trainer.loader = iter(train_loader) # very slow, can take ~10s to shuffle...
 
             gui = NeRFGUI(opt, trainer)
             gui.render()
 
         else:
             train_dataset = NeRFDataset(opt.path, type='train', mode=opt.mode, scale=opt.scale, preload=opt.preload)
-            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
+            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.num_rays, shuffle=True, num_workers=8, pin_memory=True)
             valid_dataset = NeRFDataset(opt.path, type='val', mode=opt.mode, downscale=2, scale=opt.scale, preload=opt.preload)
-            valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1)
+            valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1, pin_memory=True)
 
-            trainer.train(train_loader, valid_loader, 200)
+            # train 200 epochs, each epoch has 100 steps --> in total 20,000 steps
+            trainer.train(train_loader, valid_loader, 200, 100)
 
             # also test
             test_dataset = NeRFDataset(opt.path, type='test', mode=opt.mode, scale=opt.scale, preload=opt.preload)
-            test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1)
-
+            test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, pin_memory=True)
             if opt.mode == 'blender':
                 trainer.evaluate(test_loader) # blender has gt, so evaluate it.
             else:

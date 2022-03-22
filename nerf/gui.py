@@ -39,6 +39,10 @@ class OrbitCamera:
         res[0, 2] = self.W // 2
         res[1, 2] = self.H // 2
         return res
+
+    @property
+    def focal(self):
+        return self.H / (2 * np.tan(np.radians(self.fovy) / 2))
     
     def orbit(self, dx, dy):
         # rotate along camera up/side axis!
@@ -78,6 +82,8 @@ class NeRFGUI:
         self.need_update = True # camera moved, should reset accumulation
         self.spp = 1 # sample per pixel
 
+        self.directions = get_ray_directions(self.H, self.W, [self.cam.focal] * 2)  # [H, W, 3]
+
         dpg.create_context()
         self.register_dpg()
         self.test_step()
@@ -114,7 +120,8 @@ class NeRFGUI:
             starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             starter.record()
 
-            outputs = self.trainer.test_gui(self.cam.pose, self.cam.intrinsics, self.W, self.H, self.bg_color, self.spp)
+            rays_o, rays_d = get_rays(self.directions, torch.from_numpy(self.cam.pose))  # [H, W, 3]
+            outputs = self.trainer.test_gui(rays_o, rays_d, self.bg_color, self.spp)
 
             ender.record()
             torch.cuda.synchronize()
@@ -146,7 +153,6 @@ class NeRFGUI:
             dpg.add_image("_texture")
 
         dpg.set_primary_window("_primary_window", True)
-
 
 
         with dpg.window(label="Control", tag="_control_window", width=400, height=250):
@@ -237,6 +243,8 @@ class NeRFGUI:
                 # fov slider
                 def callback_set_fovy(sender, app_data):
                     self.cam.fovy = app_data
+                    # update directions if focal changed.
+                    self.directions = get_ray_directions(self.H, self.W, [self.cam.focal] * 2)
                     self.need_update = True
 
                 dpg.add_slider_int(label="FoV (vertical)", min_value=1, max_value=120, format="%d deg", default_value=self.cam.fovy, callback=callback_set_fovy)

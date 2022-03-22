@@ -186,7 +186,7 @@ class NeRFDataset(Dataset):
             self.all_rgbs = torch.stack(self.all_rgbs, dim=0)
 
         # mix all rays from different images in training
-        if self.type == 'train' or self.type == 'all':
+        if self.type != 'test':
             self.all_rays_o = self.all_rays_o.view(-1, 3) # [NHW, 3]
             self.all_rays_d = self.all_rays_d.view(-1, 3) # [NHW, 3]
             if self.all_rgbs is not None:
