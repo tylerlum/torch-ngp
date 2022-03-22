@@ -295,19 +295,11 @@ class Trainer(object):
     ### ------------------------------
 
     def train_step(self, data):
-
-<<<<<<< HEAD
-        # sample rays
-        B, H, W, C = images.shape
-        rays_o, rays_d, inds = get_rays(poses, intrinsics, H, W, self.conf['num_rays'])
-        images = torch.gather(images.reshape(B, -1, C), 1, torch.stack(C*[inds], -1)) # [B, N, 3/4]
-=======
         rays_o = data['rays_o'] # [N, 3]
         rays_d = data['rays_d'] # [N, 3]
         rgbs = data['rgbs'] # [N, 3/4]
 
         N, C = rgbs.shape
->>>>>>> upstream/main
 
         # train with random background color if using alpha mixing
         #bg_color = torch.ones(3, device=self.device) # [3], fixed white background
@@ -324,12 +316,6 @@ class Trainer(object):
         return pred_rgb, rgbs, loss
 
     def eval_step(self, data):
-
-<<<<<<< HEAD
-        # sample rays
-        B, H, W, C = images.shape
-        rays_o, rays_d, _ = get_rays(poses, intrinsics, H, W, -1)
-=======
         rays_o = data['rays_o'] # [B, H, W, 3]
         rays_d = data['rays_d'] # [B, H, W, 3]
         rgbs = data['rgbs'] # [B, H, W, 3/4]
@@ -337,20 +323,12 @@ class Trainer(object):
         B, H, W, C = rgbs.shape
         rays_o = rays_o.view(-1, 3)
         rays_d = rays_d.view(-1, 3)
->>>>>>> upstream/main
 
         # eval with fixed background color
         bg_color = torch.ones(3, device=self.device) # [3]
         if C == 4:
-<<<<<<< HEAD
-            gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
-        else:
-            gt_rgb = images
-
-=======
             rgbs = rgbs[..., :3] * rgbs[..., 3:] + bg_color * (1 - rgbs[..., 3:])
 
->>>>>>> upstream/main
         outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **self.conf)
 
         pred_rgb = outputs['rgb'].reshape(B, H, W, -1)
@@ -361,14 +339,7 @@ class Trainer(object):
         return pred_rgb, pred_depth, rgbs, loss
 
     # moved out bg_color and perturb for more flexible control...
-<<<<<<< HEAD
     def test_step(self, data, bg_color=None, perturb=False):
-        poses = data["pose"] # [B, 4, 4]
-        intrinsics = data["intrinsic"] # [B, 3, 3]
-        H, W = int(data['H'][0]), int(data['W'][0]) # get the target size...
-=======
-    def test_step(self, data, bg_color=None, perturb=False):
->>>>>>> upstream/main
 
         rays_o = data['rays_o'] # [B, H, W, 3]
         rays_d = data['rays_d'] # [B, H, W, 3]
@@ -418,12 +389,9 @@ class Trainer(object):
     def train(self, train_loader, valid_loader, max_epochs, max_steps_per_epoch=-1):
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
-<<<<<<< HEAD
-=======
 
         # to support max_steps_per_epoch
         self.loader = iter(train_loader)
->>>>>>> upstream/main
 
         for epoch in range(self.epoch, max_epochs + 1):
             self.epoch = epoch
@@ -492,15 +460,10 @@ class Trainer(object):
                 self.model.update_extra_state()
 
         total_loss = torch.tensor([0], dtype=torch.float32, device=self.device)
-<<<<<<< HEAD
-
-        loader = iter(train_loader)
-=======
 
         # may cause a very slow starting...
         if self.loader is None:
             self.loader = iter(train_loader)
->>>>>>> upstream/main
 
         for _ in range(step):
 
@@ -508,15 +471,9 @@ class Trainer(object):
             try:
                 data = next(self.loader)
             except StopIteration:
-<<<<<<< HEAD
-                loader = iter(train_loader)
-                data = next(loader)
-
-=======
                 self.loader = iter(train_loader)
                 data = next(self.loader)
 
->>>>>>> upstream/main
             self.global_step += 1
 
             data = self.prepare_data(data)
@@ -623,24 +580,16 @@ class Trainer(object):
         # distributedSampler: must call set_epoch() to shuffle indices across multiple epochs
         # ref: https://pytorch.org/docs/stable/data.html
         if self.world_size > 1:
-<<<<<<< HEAD
-            loader.sampler.set_epoch(self.epoch)
-
-=======
             train_loader.sampler.set_epoch(self.epoch)
 
         if max_steps_per_epoch == -1:
             max_steps_per_epoch = len(train_loader)
 
->>>>>>> upstream/main
         if self.local_rank == 0:
             pbar = tqdm.tqdm(total=max_steps_per_epoch, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
 
         self.local_step = 0
 
-<<<<<<< HEAD
-        for data in loader:
-=======
         for _ in range(max_steps_per_epoch):
 
             # mimic an infinite loop dataloader (in case the total dataset is smaller than step)
@@ -652,7 +601,6 @@ class Trainer(object):
 
             if self.local_step >= max_steps_per_epoch:
                 break
->>>>>>> upstream/main
 
             self.local_step += 1
             self.global_step += 1
@@ -732,16 +680,12 @@ class Trainer(object):
 
         with torch.no_grad():
             self.local_step = 0
-<<<<<<< HEAD
-            for data in loader:
-=======
 
             if self.model.cuda_ray:
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     self.model.update_extra_state()
 
             for data in loader:
->>>>>>> upstream/main
                 self.local_step += 1
 
                 data = self.prepare_data(data)

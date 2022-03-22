@@ -4,7 +4,7 @@ trimesh
 opencv-python
 tensorboardX
 torch>=1.10
-numpy 
+numpy
 pandas
 tqdm
 matplotlib
@@ -12,3 +12,5 @@ PyMCubes
 rich
 pysdf
 dearpygui
+scipy
+kornia
