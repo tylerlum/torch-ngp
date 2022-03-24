@@ -38,12 +38,15 @@ if __name__ == '__main__':
 
         trainer = Trainer('ngp', vars(opt), model, workspace=opt.workspace, criterion=criterion, fp16=opt.fp16, metrics=[PSNRMeter()], use_checkpoint='latest')
 
+        test_dataset = NeRFDataset(opt.path, type='test', mode=opt.mode, scale=opt.scale, preload=opt.preload)
+
+        _, test_poses = create_pose_var(test_dataset)
+
         if opt.gui:
             gui = NeRFGUI(opt, trainer)
             gui.render()
 
         else:
-            test_dataset = NeRFDataset(opt.path, type='test', mode=opt.mode, scale=opt.scale, preload=opt.preload)
             test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1)
 
             if opt.mode == 'blender':
@@ -57,6 +60,7 @@ if __name__ == '__main__':
             {'name': 'encoding', 'params': list(model.encoder.parameters())},
             {'name': 'net', 'params': list(model.sigma_net.parameters()) + list(model.color_net.parameters()), 'weight_decay': 1e-6},
         ], lr=1e-2, betas=(0.9, 0.99), eps=1e-15)
+
 
         # need different milestones for GUI/CMD mode.
         scheduler = lambda optimizer: optim.lr_scheduler.MultiStepLR(optimizer, milestones=[625, 1000] if opt.gui else [100, 150], gamma=0.33)
@@ -72,22 +76,30 @@ if __name__ == '__main__':
             trainer.train_loader = train_loader
             trainer.loader = iter(train_loader) # very slow, can take ~10s to shuffle...
 
+            # Create and attach poses to trainer
+            train_pose_vars, train_poses = create_pose_var(train_dataset, requires_grad=opt.opt_poses)
+            trainer.train_pose_vars = train_pose_vars
+
             gui = NeRFGUI(opt, trainer)
             gui.render()
 
         else:
             train_dataset = NeRFDataset(opt.path, type='train', mode=opt.mode, scale=opt.scale, preload=opt.preload)
             train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.num_rays, shuffle=True, num_workers=8, pin_memory=True)
+            train_pose_vars, train_poses = create_pose_var(train_dataset, requires_grad=opt.opt_poses)
+            trainer.train_pose_vars = train_pose_vars
             valid_dataset = NeRFDataset(opt.path, type='val', mode=opt.mode, downscale=2, scale=opt.scale, preload=opt.preload)
             valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1, pin_memory=True)
+            _, valid_poses = create_pose_var(valid_dataset)
 
             # train 200 epochs, each epoch has 100 steps --> in total 20,000 steps
-            trainer.train(train_loader, valid_loader, 200, 100)
+            trainer.train(train_loader, train_poses, valid_loader, valid_poses, 200, 100)
 
             # also test
             test_dataset = NeRFDataset(opt.path, type='test', mode=opt.mode, scale=opt.scale, preload=opt.preload)
             test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, pin_memory=True)
+            _, test_poses = create_pose_var(test_dataset)
             if opt.mode == 'blender':
-                trainer.evaluate(test_loader) # blender has gt, so evaluate it.
+                trainer.evaluate(test_loader, test_poses) # blender has gt, so evaluate it.
             else:
-                trainer.test(test_loader) # colmap doesn't have gt, so just test.
+                trainer.test(test_loader, test_poses) # colmap doesn't have gt, so just test.

@@ -29,6 +29,9 @@ from torch_ema import ExponentialMovingAverage
 
 from kornia import create_meshgrid
 
+from scipy.spatial.transform import Rotation
+import lietorch
+
 def seed_everything(seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -78,10 +81,10 @@ def get_rays(directions, c2w):
         rays_d: (H*W, 3), the normalized direction of the rays in world coordinate
     """
     # Rotate ray directions from camera coordinate to the world coordinate
-    rays_d = directions @ c2w[:3, :3].T  # (H, W, 3)
+    rays_d = lietorch.SO3(c2w).act(directions)
     # rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
     # The origin of all rays is the camera origin in world coordinate
-    rays_o = c2w[:3, 3].expand(rays_d.shape)  # (H, W, 3)
+    rays_o = c2w.translation()[...,:3].expand(rays_d.shape)  # (H, W, 3)
 
     return rays_o, rays_d
 
@@ -161,7 +164,9 @@ class Trainer(object):
                  conf, # extra conf
                  model, # network
                  criterion=None, # loss function, if None, assume inline implementation in train_step
+                 train_pose_vars=None, # poses to use for train images
                  optimizer=None, # optimizer
+                 pose_optimizer=None, #optimizer for camera poses
                  ema_decay=None, # if use EMA, set the decay
                  lr_scheduler=None, # scheduler
                  metrics=[], # metrics for evaluation, if None, use val_loss to measure performance, else use the first metric.
@@ -183,6 +188,7 @@ class Trainer(object):
 
         self.name = name
         self.conf = conf
+        self.train_pose_vars = train_pose_vars
         self.mute = mute
         self.metrics = metrics
         self.local_rank = local_rank
@@ -294,9 +300,8 @@ class Trainer(object):
 
     ### ------------------------------
 
-    def train_step(self, data):
-        rays_o = data['rays_o'] # [N, 3]
-        rays_d = data['rays_d'] # [N, 3]
+    def train_step(self, data, train_poses):
+        rays_o, rays_d = get_rays(data['directions'], train_poses[data['index']])
         rgbs = data['rgbs'] # [N, 3/4]
 
         N, C = rgbs.shape
@@ -315,9 +320,9 @@ class Trainer(object):
 
         return pred_rgb, rgbs, loss
 
-    def eval_step(self, data):
-        rays_o = data['rays_o'] # [B, H, W, 3]
-        rays_d = data['rays_d'] # [B, H, W, 3]
+    def eval_step(self, data, valid_poses):
+        print(data['directions'].shape, valid_poses[data['index']].shape, data['index'])
+        rays_o, rays_d = get_rays(data['directions'], valid_poses[data['index']])
         rgbs = data['rgbs'] # [B, H, W, 3/4]
 
         B, H, W, C = rgbs.shape
@@ -339,10 +344,13 @@ class Trainer(object):
         return pred_rgb, pred_depth, rgbs, loss
 
     # moved out bg_color and perturb for more flexible control...
-    def test_step(self, data, bg_color=None, perturb=False):
+    def test_step(self, data, test_poses=None, bg_color=None, perturb=False):
 
-        rays_o = data['rays_o'] # [B, H, W, 3]
-        rays_d = data['rays_d'] # [B, H, W, 3]
+        # Support case for GUI test.
+        if test_poses:
+            rays_o, rays_d = get_rays(data['directions'], test_poses[data['index']])
+        else:
+            rays_o, rays_d = data['rays_o'], data['rays_d']
         B, H, W, _ = rays_o.shape
 
         rays_o = rays_o.view(-1, 3)
@@ -386,7 +394,8 @@ class Trainer(object):
 
     ### ------------------------------
 
-    def train(self, train_loader, valid_loader, max_epochs, max_steps_per_epoch=-1):
+    def train(self, train_loader, train_poses, valid_loader, valid_poses,
+              max_epochs, max_steps_per_epoch=-1):
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
 
@@ -396,24 +405,24 @@ class Trainer(object):
         for epoch in range(self.epoch, max_epochs + 1):
             self.epoch = epoch
 
-            self.train_one_epoch(train_loader, max_steps_per_epoch)
+            self.train_one_epoch(train_loader, train_poses, max_steps_per_epoch)
 
             if self.workspace is not None and self.local_rank == 0:
                 self.save_checkpoint(full=True, best=False)
 
             if self.epoch % self.eval_interval == 0:
-                self.evaluate_one_epoch(valid_loader)
+                self.evaluate_one_epoch(valid_loader, valid_poses)
                 self.save_checkpoint(full=False, best=True)
 
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer.close()
 
-    def evaluate(self, loader):
+    def evaluate(self, loader, valid_poses):
         self.use_tensorboardX, use_tensorboardX = False, self.use_tensorboardX
-        self.evaluate_one_epoch(loader)
+        self.evaluate_one_epoch(loader, valid_poses)
         self.use_tensorboardX = use_tensorboardX
 
-    def test(self, loader, save_path=None):
+    def test(self, loader, test_poses, save_path=None):
 
         if save_path is None:
             save_path = os.path.join(self.workspace, 'results')
@@ -435,7 +444,7 @@ class Trainer(object):
                 data = self.prepare_data(data)
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth = self.test_step(data)
+                    preds, preds_depth = self.test_step(data, test_poses)
 
                 path = os.path.join(save_path, f'{i:04d}.png')
                 path_depth = os.path.join(save_path, f'{i:04d}_depth.png')
@@ -450,7 +459,7 @@ class Trainer(object):
         self.log(f"==> Finished Test.")
 
     # [GUI] just train for 16 steps, without any other overhead that may slow down rendering.
-    def train_gui(self, train_loader, step=16):
+    def train_gui(self, train_loader, train_poses, step=16):
 
         self.model.train()
 
@@ -481,7 +490,7 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
+                preds, truths, loss = self.train_step(data, train_poses)
 
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -562,7 +571,7 @@ class Trainer(object):
 
         return data
 
-    def train_one_epoch(self, train_loader, max_steps_per_epoch=-1):
+    def train_one_epoch(self, train_loader, train_poses, max_steps_per_epoch=-1):
         self.log(f"==> Start Training Epoch {self.epoch}, lr={self.optimizer.param_groups[0]['lr']:.6f} ...")
 
         total_loss = 0
@@ -610,7 +619,7 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
+                preds, truths, loss = self.train_step(data, train_poses)
 
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -661,7 +670,7 @@ class Trainer(object):
         self.log(f"==> Finished Epoch {self.epoch}.")
 
 
-    def evaluate_one_epoch(self, loader):
+    def evaluate_one_epoch(self, loader, valid_poses):
         self.log(f"++> Evaluate at epoch {self.epoch} ...")
 
         total_loss = 0
@@ -691,7 +700,7 @@ class Trainer(object):
                 data = self.prepare_data(data)
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth, truths, loss = self.eval_step(data)
+                    preds, preds_depth, truths, loss = self.eval_step(data, valid_poses)
 
 
                 # all_gather/reduce the statistics (NCCL only support all_*)
@@ -899,5 +908,35 @@ def get_config_parser():
     parser.add_argument('--radius', type=float, default=5, help="default GUI camera radius from center")
     parser.add_argument('--fovy', type=float, default=90, help="default GUI camera fovy")
     parser.add_argument('--max_spp', type=int, default=64, help="GUI rendering max sample per pixel")
+    parser.add_argument('--opt_poses', action='store_true', help='Flag to train camera poses in addition to NeRF params')
 
     return parser
+
+def SE3_from_transform(T):
+    """
+    Constructs a lietorch.SE3 object from a batch of transform matrices.
+    Args:
+        T: batch of numpy transform matrices, [B, 4, 4].
+    Returns a lietorch.SE3 object with the correct data.
+    """
+    # Check if we need to add a batch dim.
+    if len(T.shape) < 3:
+        T = T.view(1, 4, 4)
+
+    q = Rotation.from_matrix(T[..., :3, :3]).as_quat()
+    p = T[..., :3, -1]
+
+    pose_data = torch.from_numpy(np.concatenate([p,q], -1)).float()
+
+    return pose_data
+
+def create_pose_var(dataset, requires_grad=False):
+    pose_var = SE3_from_transform(dataset.poses).cuda()
+    pose_var.requires_grad = requires_grad
+
+    transforms = lietorch.SE3(
+        pose_var.reshape(dataset.N, 1, 1, 7).expand(-1, dataset.H, dataset.W, -1))
+
+    transforms.data = transforms.data.reshape(dataset.all_poses.data.shape)
+
+    return pose_var, transforms

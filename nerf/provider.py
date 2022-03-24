@@ -69,14 +69,14 @@ class NeRFDataset(Dataset):
         else:
             # we have to actually read an image to get H and W later.
             self.H = self.W = None
-        
+
         # read images
         frames = transform["frames"]
-        frames = sorted(frames, key=lambda d: d['file_path'])    
-        
+        frames = sorted(frames, key=lambda d: d['file_path'])
+
         # for colmap, manually interpolate a test set.
         if mode == 'colmap' and type == 'test':
-            
+
             # choose two random poses, and interpolate between.
             f0, f1 = np.random.choice(frames, 2, replace=False)
             pose0 = nerf_matrix_to_ngp(np.array(f0['transform_matrix'], dtype=np.float32), scale=self.scale) # [4, 4]
@@ -101,7 +101,7 @@ class NeRFDataset(Dataset):
                 elif type == 'val':
                     frames = frames[:1]
                 # else 'all': use all frames
-            
+
             self.poses = []
             self.images = []
             for f in frames:
@@ -112,7 +112,7 @@ class NeRFDataset(Dataset):
                 # there are non-exist paths in fox...
                 if not os.path.exists(f_path):
                     continue
-                
+
                 pose = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
                 pose = nerf_matrix_to_ngp(pose, scale=self.scale)
 
@@ -122,25 +122,25 @@ class NeRFDataset(Dataset):
                     self.W = image.shape[1] // downscale
 
                 # add support for the alpha channel as a mask.
-                if image.shape[-1] == 3: 
+                if image.shape[-1] == 3:
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 else:
                     image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
 
                 if image.shape[0] != self.H or image.shape[1] != self.W:
                     image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
-                    
+
                 image = image.astype(np.float32) / 255 # [H, W, 3/4]
 
                 self.poses.append(pose)
                 self.images.append(image)
-            
-        self.poses = np.stack(self.poses, axis=0)
+
+        self.N = len(self.poses)
+
         if self.images is not None:
             self.images = np.stack(self.images, axis=0)
 
         # load intrinsics
-        
         if 'fl_x' in transform or 'fl_y' in transform:
             fl_x = (transform['fl_x'] if 'fl_x' in transform else transform['fl_y']) / downscale
             fl_y = (transform['fl_y'] if 'fl_y' in transform else transform['fl_x']) / downscale
@@ -158,15 +158,15 @@ class NeRFDataset(Dataset):
 
         # pre-generate rays from poses
         self.directions = get_ray_directions(self.H, self.W, [fl_x, fl_y], [cx, cy])  # [H, W, 3]
+        self.all_directions = self.directions.reshape(1, self.H, self.W, 3)
+        self.all_directions = self.all_directions.expand(self.N, -1, -1, -1)
 
-        self.all_rays_o = []
-        self.all_rays_d = []
-        for pose in self.poses:
-            pose = torch.from_numpy(pose)
-            rays_o, rays_d = get_rays(self.directions, pose)  # [H, W, 3]
-            self.all_rays_o.append(rays_o)
-            self.all_rays_d.append(rays_d)
-            
+        # TODO(pculbert): Support adding pose noise.
+        self.poses = np.stack(self.poses, axis=0)
+        self.all_poses = lietorch.SE3(SE3_from_transform(self.poses))
+        self.all_poses.data = self.all_poses.data.reshape(self.N, 1, 1, 7)
+        self.all_poses.data = self.all_poses.data.expand(-1, self.H, self.W, -1)
+
         if self.images is not None:
             self.all_rgbs = []
             for image in self.images:
@@ -175,42 +175,42 @@ class NeRFDataset(Dataset):
         else:
             self.all_rgbs = None
 
-        # free 
+        # free
+        del self.directions
         del self.images
-        del self.poses
-        
+
         # stack
-        self.all_rays_o = torch.stack(self.all_rays_o, dim=0) # [N, H, W, 3]
-        self.all_rays_d = torch.stack(self.all_rays_d, dim=0) # [N, H, W, 3]
         if self.all_rgbs is not None:
             self.all_rgbs = torch.stack(self.all_rgbs, dim=0)
 
         # mix all rays from different images in training
         if self.type == 'train' or self.type == 'all':
-            self.all_rays_o = self.all_rays_o.view(-1, 3) # [NHW, 3]
-            self.all_rays_d = self.all_rays_d.view(-1, 3) # [NHW, 3]
+            self.all_directions = self.all_directions.reshape(-1, 3)
+            self.all_poses.data = self.all_poses.data.reshape(-1, 7)
             if self.all_rgbs is not None:
                 self.all_rgbs = self.all_rgbs.view(-1, self.all_rgbs.shape[-1])
-        
+
+        self.indices = torch.arange(len(self))
+
         if preload:
-            self.all_rays_o = self.all_rays_o.cuda()
-            self.all_rays_d = self.all_rays_d.cuda()
+            self.all_directions = self.all_directions.cuda()
+            self.all_poses = self.all_poses.cuda()
             if self.all_rgbs is not None:
                 self.all_rgbs = self.all_rgbs.cuda()
 
 
     def __len__(self):
-        return self.all_rays_o.shape[0]
+        return self.all_directions.shape[0]
 
     def __getitem__(self, index):
 
         results = {
-            'rays_o': self.all_rays_o[index],
-            'rays_d': self.all_rays_d[index],
+            'directions': self.all_directions[index],
+            'pose_data': self.all_poses.data[index],
             'index': index,
         }
 
-        if self.type != 'test' or self.mode == 'blender':    
+        if self.type != 'test' or self.mode == 'blender':
             results['rgbs'] = self.all_rgbs[index]
-        
+
         return results
