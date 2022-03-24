@@ -5,3 +5,5 @@ trial*/
 volsdf/
 **volsdf*
 **ipynb_checkpoints**
+*.egg-info/
+*.egg

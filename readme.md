@@ -1,3 +1,62 @@
+# Torch Neural Graphics Primatives - MSL Fork
+
+This is a fork of the repository [torch-ngp](https://github.com/ashawkey/torch-ngp), which is itself based on [instant-ngp](https://github.com/NVlabs/instant-ngp) by Thomas Müller.
+
+The goal of this repository is to provide an fast and easy to use implementation of basic NeRF utilities for more efficient research iteration.
+
+* MSL verified timing results:
+    - LEGO RESULTS
+    - FOX RESULTS
+
+## Installation
+1) Clone this repository
+    ```bash
+    git clone --recursive git@github.com:StanfordMSL/torch-ngp.git
+    ```
+    * Make sure to use the recursive argument because of the `cutlass` submodule which will otherwise throw errors for some functionality.
+    * If you want to add this repo as a submodule to a current project then use:
+        ```bash
+        git submodule add git@github.com:StanfordMSL/torch-ngp.git
+        cd torch-ngp
+        git submodule update --init --recursive # To add cutlass
+        ```
+
+2) Setup a Python environment 
+    ```bash
+    cd torch-ngp
+    virtualenv venv # instructions for virtualenv but should be similar with conda etc.
+    source venv/bin/activate
+    pip install -r requirements.txt
+    pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
+    
+    # To install the torch_ngp package
+    pip install -e .
+    ```
+
+3) Download the basic NeRF Datasets
+    ```bash
+    cd ... # wherever you want your data
+    mkdir -p data
+    cd data
+    wget http://cseweb.ucsd.edu/~viscomp/projects/LF/papers/ECCV20/nerf/nerf_example_data.zip
+    unzip nerf_example_data.zip
+    cd ..
+    ```
+
+## Usage
+There are a variety of ways to use this repository. The `main_nerf.py` script uses all of the functionality of the original repository to run NeRF examples. Find the usage instructions for this script in the documentation of [torch-ngp](https://github.com/ashawkey/torch-ngp).
+
+Alternatively, `nerf_basic.py` shows a more stripped back implementation of the core functionality of the packages in this repository.
+
+## Goals
+    - [] Pose optimization functionality
+    - [] Benchmark results
+
+## Contents of old `readme.md` (click to expand)
+
+<details>
+<summary> CLICK </summary>
+
 # torch-ngp
 
 A pytorch implementation of [instant-ngp](https://github.com/NVlabs/instant-ngp), as described in [_Instant Neural Graphics Primitives with a Multiresolution Hash Encoding_](https://nvlabs.github.io/instant-ngp/assets/mueller2022instant.pdf).
@@ -123,7 +182,7 @@ check the `scripts` directory for more provided examples.
 * 2.15: add the official [tinycudann](https://github.com/NVlabs/tiny-cuda-nn) as an alternative backend.    
 * 2.10: add cuda_ray, can train/infer faster, but performance is worse currently.
 * 2.6: add support for RGBA image.
-* 1.30: fixed atomicAdd() to use __half2 in HashGrid Encoder's backward, now the training speed with fp16 is as expected!
+* 1.30: fixed atomicAdd() to use `__half2` in HashGrid Encoder's backward, now the training speed with fp16 is as expected!
 * 1.29: 
     * finished an experimental binding of fully-fused MLP.
     * replace SHEncoder with a CUDA implementation.
@@ -160,3 +219,4 @@ check the `scripts` directory for more provided examples.
     }
     ```
 * The NeRF GUI is developed with [DearPyGui](https://github.com/hoffstadt/DearPyGui).
+</details>
