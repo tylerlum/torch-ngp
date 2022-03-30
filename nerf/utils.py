@@ -1,6 +1,7 @@
 import argparse
 import os
 import glob
+import sys
 import tqdm
 import random
 import warnings
@@ -622,6 +623,15 @@ class Trainer(object):
                 preds, truths, loss = self.train_step(data, train_poses)
 
             self.scaler.scale(loss).backward()
+
+            if self.pose_optimizer:
+                pose_loss = 1e-1 * torch.nn.MSELoss()(train_poses[data['index']].log(),
+                                           lietorch.SE3(data['pose_data']).log())
+
+                self.scaler.scale(pose_loss).backward()
+
+                loss += pose_loss
+
             self.scaler.step(self.optimizer)
             self.scaler.update()
 

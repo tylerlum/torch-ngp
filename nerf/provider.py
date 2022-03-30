@@ -206,7 +206,7 @@ class NeRFDataset(Dataset):
 
         results = {
             'directions': self.all_directions[index],
-            'pose_data': self.all_poses.data[index],
+            'pose_data': self.all_poses.data[index].detach(),
             'index': index,
         }
 

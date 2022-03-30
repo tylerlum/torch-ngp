@@ -80,6 +80,11 @@ if __name__ == '__main__':
             train_pose_vars, train_poses = create_pose_var(train_dataset, requires_grad=opt.opt_poses)
             trainer.train_pose_vars = train_pose_vars
 
+            # Create pose optimizer + attach, if training.
+            if opt.opt_poses:
+                pose_optimizer = lambda model: torch.optim.Adam([train_pose_vars])
+                trainer.pose_optimizer = pose_optimizer
+
             gui = NeRFGUI(opt, trainer)
             gui.render()
 
@@ -88,6 +93,10 @@ if __name__ == '__main__':
             train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.num_rays, shuffle=True, num_workers=8, pin_memory=True)
             train_pose_vars, train_poses = create_pose_var(train_dataset, requires_grad=opt.opt_poses)
             trainer.train_pose_vars = train_pose_vars
+            # Create pose optimizer + attach, if training.
+            if opt.opt_poses:
+                pose_optimizer = lambda model: torch.optim.Adam([train_pose_vars])
+                trainer.pose_optimizer = pose_optimizer
             valid_dataset = NeRFDataset(opt.path, type='val', mode=opt.mode, downscale=2, scale=opt.scale, preload=opt.preload)
             valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1, pin_memory=True)
             _, valid_poses = create_pose_var(valid_dataset)
