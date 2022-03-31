@@ -38,9 +38,7 @@ if __name__ == '__main__':
 
         trainer = Trainer('ngp', vars(opt), model, workspace=opt.workspace, criterion=criterion, fp16=opt.fp16, metrics=[PSNRMeter()], use_checkpoint='latest')
 
-        test_dataset = NeRFDataset(opt.path, type='test', mode=opt.mode, scale=opt.scale, preload=opt.preload)
-
-        _, test_poses = create_pose_var(test_dataset)
+        test_dataset = NeRFDataset(opt.path, type='test', mode=opt.mode, scale=opt.scale, preload=opt.preload, pose_noise=opt.pose_noise)
 
         if opt.gui:
             gui = NeRFGUI(opt, trainer)
@@ -70,18 +68,17 @@ if __name__ == '__main__':
         # need different dataset type for GUI/CMD mode.
 
         if opt.gui:
-            train_dataset = NeRFDataset(opt.path, type='train', mode=opt.mode, scale=opt.scale, preload=opt.preload)
+            train_dataset = NeRFDataset(opt.path, type='train', mode=opt.mode, scale=opt.scale, preload=opt.preload, pose_noise=opt.pose_noise)
             train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.num_rays, shuffle=True, num_workers=8, pin_memory=True)
             # attach dataloader to trainer
             trainer.train_loader = train_loader
             trainer.loader = iter(train_loader) # very slow, can take ~10s to shuffle...
 
-            # Create and attach poses to trainer
-            train_pose_vars, train_poses = create_pose_var(train_dataset, requires_grad=opt.opt_poses)
-            trainer.train_pose_vars = train_pose_vars
-
             # Create pose optimizer + attach, if training.
             if opt.opt_poses:
+                # Create and attach poses to trainer
+                train_pose_vars = create_pose_var(train_dataset, requires_grad=opt.opt_poses)
+                trainer.train_pose_vars = train_pose_vars
                 pose_optimizer = lambda model: torch.optim.Adam([train_pose_vars])
                 trainer.pose_optimizer = pose_optimizer
 
@@ -89,26 +86,26 @@ if __name__ == '__main__':
             gui.render()
 
         else:
-            train_dataset = NeRFDataset(opt.path, type='train', mode=opt.mode, scale=opt.scale, preload=opt.preload)
+            train_dataset = NeRFDataset(opt.path, type='train', mode=opt.mode, scale=opt.scale, preload=opt.preload, pose_noise=opt.pose_noise)
             train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.num_rays, shuffle=True, num_workers=8, pin_memory=True)
-            train_pose_vars, train_poses = create_pose_var(train_dataset, requires_grad=opt.opt_poses)
-            trainer.train_pose_vars = train_pose_vars
             # Create pose optimizer + attach, if training.
             if opt.opt_poses:
+                train_pose_vars= create_pose_var(train_dataset,
+                                                 requires_grad=opt.opt_poses)
+                trainer.train_pose_vars = train_pose_vars
                 pose_optimizer = lambda model: torch.optim.Adam([train_pose_vars])
                 trainer.pose_optimizer = pose_optimizer
+
             valid_dataset = NeRFDataset(opt.path, type='val', mode=opt.mode, downscale=2, scale=opt.scale, preload=opt.preload)
             valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1, pin_memory=True)
-            _, valid_poses = create_pose_var(valid_dataset)
 
             # train 200 epochs, each epoch has 100 steps --> in total 20,000 steps
-            trainer.train(train_loader, train_poses, valid_loader, valid_poses, 200, 100)
+            trainer.train(train_loader, valid_loader, 50, 100)
 
             # also test
             test_dataset = NeRFDataset(opt.path, type='test', mode=opt.mode, scale=opt.scale, preload=opt.preload)
             test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, pin_memory=True)
-            _, test_poses = create_pose_var(test_dataset)
             if opt.mode == 'blender':
-                trainer.evaluate(test_loader, test_poses) # blender has gt, so evaluate it.
+                trainer.evaluate(test_loader) # blender has gt, so evaluate it.
             else:
-                trainer.test(test_loader, test_poses) # colmap doesn't have gt, so just test.
+                trainer.test(test_loader) # colmap doesn't have gt, so just test.

@@ -25,7 +25,8 @@ def nerf_matrix_to_ngp(pose, scale=0.33):
 
 
 class NeRFDataset(Dataset):
-    def __init__(self, path, type='train', mode='colmap', preload=False, downscale=1, scale=0.33, n_test=10):
+    def __init__(self, path, type='train', mode='colmap', preload=False,
+                 downscale=1, scale=0.33, n_test=10, pose_noise=0.0):
         super().__init__()
         # path: the json file path.
 
@@ -161,9 +162,15 @@ class NeRFDataset(Dataset):
         self.all_directions = self.directions.reshape(1, self.H, self.W, 3)
         self.all_directions = self.all_directions.expand(self.N, -1, -1, -1)
 
-        # TODO(pculbert): Support adding pose noise.
         self.poses = np.stack(self.poses, axis=0)
-        self.all_poses = lietorch.SE3(SE3_from_transform(self.poses))
+        self.poses = lietorch.SE3(SE3_from_transform(self.poses))
+
+        # Add pose noise, if desired.
+        if pose_noise > 0.0 and type == 'train':
+            self.poses = (self.poses.exp(pose_noise * torch.randn(self.N, 7))
+                              * self.poses)
+
+        self.all_poses = lietorch.SE3(self.poses.data)
         self.all_poses.data = self.all_poses.data.reshape(self.N, 1, 1, 7)
         self.all_poses.data = self.all_poses.data.expand(-1, self.H, self.W, -1)
 

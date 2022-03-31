@@ -224,6 +224,8 @@ class Trainer(object):
         else:
             self.optimizer = optimizer(self.model)
 
+        self.pose_optimizer = pose_optimizer
+
         if lr_scheduler is None:
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1) # fake scheduler
         else:
@@ -301,8 +303,18 @@ class Trainer(object):
 
     ### ------------------------------
 
-    def train_step(self, data, train_poses):
-        rays_o, rays_d = get_rays(data['directions'], train_poses[data['index']])
+    def train_step(self, data):
+        if self.pose_optimizer:
+
+            train_poses = self.train_pose_vars.retr()
+            train_poses.data = train_poses.data.expand(-1, data['H'], data['W'], -1)
+            train_poses.data = train_poses.data.reshape(-1, 7)
+            rays_o, rays_d = get_rays(data['directions'], train_poses[data['index']])
+
+        else:
+
+            rays_o, rays_d = get_rays(data['directions'], data['pose_data'])
+
         rgbs = data['rgbs'] # [N, 3/4]
 
         N, C = rgbs.shape
@@ -321,9 +333,8 @@ class Trainer(object):
 
         return pred_rgb, rgbs, loss
 
-    def eval_step(self, data, valid_poses):
-        print(data['directions'].shape, valid_poses[data['index']].shape, data['index'])
-        rays_o, rays_d = get_rays(data['directions'], valid_poses[data['index']])
+    def eval_step(self, data):
+        rays_o, rays_d = get_rays(data['directions'], lietorch.SE3(data['pose_data']))
         rgbs = data['rgbs'] # [B, H, W, 3/4]
 
         B, H, W, C = rgbs.shape
@@ -345,13 +356,13 @@ class Trainer(object):
         return pred_rgb, pred_depth, rgbs, loss
 
     # moved out bg_color and perturb for more flexible control...
-    def test_step(self, data, test_poses=None, bg_color=None, perturb=False):
+    def test_step(self, data, bg_color=None, perturb=False):
 
         # Support case for GUI test.
-        if test_poses:
-            rays_o, rays_d = get_rays(data['directions'], test_poses[data['index']])
-        else:
+        if data.has_key('rays_o'):
             rays_o, rays_d = data['rays_o'], data['rays_d']
+        else:
+            rays_o, rays_d = get_rays(data['directions'], lietorch.SE3(data['pose_data']))
         B, H, W, _ = rays_o.shape
 
         rays_o = rays_o.view(-1, 3)
@@ -487,6 +498,9 @@ class Trainer(object):
             self.global_step += 1
 
             data = self.prepare_data(data)
+            data['N'] = self.loader.dataset.N
+            data['H'] = self.loader.dataset.H
+            data['W'] = self.loader.dataset.W
 
             self.optimizer.zero_grad()
 
@@ -625,7 +639,7 @@ class Trainer(object):
             self.scaler.scale(loss).backward()
 
             if self.pose_optimizer:
-                pose_loss = 1e-1 * torch.nn.MSELoss()(train_poses[data['index']].log(),
+                pose_loss = 1e-3 * torch.nn.MSELoss()(train_poses[data['index']].log(),
                                            lietorch.SE3(data['pose_data']).log())
 
                 self.scaler.scale(pose_loss).backward()
@@ -919,6 +933,7 @@ def get_config_parser():
     parser.add_argument('--fovy', type=float, default=90, help="default GUI camera fovy")
     parser.add_argument('--max_spp', type=int, default=64, help="GUI rendering max sample per pixel")
     parser.add_argument('--opt_poses', action='store_true', help='Flag to train camera poses in addition to NeRF params')
+    parser.add_argument('--pose_noise', type=float, default=0.0, help='Variance of noise to add to training poses.')
 
     return parser
 
@@ -941,12 +956,6 @@ def SE3_from_transform(T):
     return pose_data
 
 def create_pose_var(dataset, requires_grad=False):
-    pose_var = SE3_from_transform(dataset.poses).cuda()
-    pose_var.requires_grad = requires_grad
+    pose_var = lietorch.LieGroupParameter(dataset.poses, requires_grad=requires_grad)
 
-    transforms = lietorch.SE3(
-        pose_var.reshape(dataset.N, 1, 1, 7).expand(-1, dataset.H, dataset.W, -1))
-
-    transforms.data = transforms.data.reshape(dataset.all_poses.data.shape)
-
-    return pose_var, transforms
+    return pose_var
