@@ -318,7 +318,8 @@ class Trainer(object):
 
         else:
 
-            rays_o, rays_d = get_rays(data['directions'], data['pose_data'])
+            rays_o, rays_d = get_rays(data['directions'],
+                                      lietorch.SE3(data['pose_data']))
 
         rgbs = data['rgbs'] # [N, 3/4]
 
