@@ -170,6 +170,7 @@ class Trainer(object):
                  pose_optimizer=None, #optimizer for camera poses
                  ema_decay=None, # if use EMA, set the decay
                  lr_scheduler=None, # scheduler
+                 pose_scheduler=None,
                  metrics=[], # metrics for evaluation, if None, use val_loss to measure performance, else use the first metric.
                  local_rank=0, # which GPU am I
                  world_size=1, # total num of GPUs
@@ -230,6 +231,8 @@ class Trainer(object):
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1) # fake scheduler
         else:
             self.lr_scheduler = lr_scheduler(self.optimizer)
+
+        self.pose_scheduler = pose_scheduler
 
         if ema_decay is not None:
             self.ema = ExponentialMovingAverage(self.model.parameters(), decay=ema_decay)
@@ -307,8 +310,10 @@ class Trainer(object):
         if self.pose_optimizer:
 
             train_poses = self.train_pose_vars.retr()
-            train_poses.data = train_poses.data.expand(-1, data['H'], data['W'], -1)
+            train_poses.data = train_poses.data.reshape(
+                -1, 1, 1, 7).expand(-1, self.H, self.W, -1)
             train_poses.data = train_poses.data.reshape(-1, 7)
+
             rays_o, rays_d = get_rays(data['directions'], train_poses[data['index']])
 
         else:
@@ -330,6 +335,12 @@ class Trainer(object):
         pred_rgb = outputs['rgb']
 
         loss = self.criterion(pred_rgb, rgbs)
+
+        if self.pose_optimizer:
+            pose_loss = 1e-1 * torch.nn.MSELoss()(train_poses[data['index']].vec(),
+                                       lietorch.SE3(data['pose_data']).vec())
+
+            loss += pose_loss
 
         return pred_rgb, rgbs, loss
 
@@ -406,8 +417,7 @@ class Trainer(object):
 
     ### ------------------------------
 
-    def train(self, train_loader, train_poses, valid_loader, valid_poses,
-              max_epochs, max_steps_per_epoch=-1):
+    def train(self, train_loader, valid_loader, max_epochs, max_steps_per_epoch=-1):
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
 
@@ -417,24 +427,24 @@ class Trainer(object):
         for epoch in range(self.epoch, max_epochs + 1):
             self.epoch = epoch
 
-            self.train_one_epoch(train_loader, train_poses, max_steps_per_epoch)
+            self.train_one_epoch(train_loader, max_steps_per_epoch)
 
             if self.workspace is not None and self.local_rank == 0:
                 self.save_checkpoint(full=True, best=False)
 
             if self.epoch % self.eval_interval == 0:
-                self.evaluate_one_epoch(valid_loader, valid_poses)
+                self.evaluate_one_epoch(valid_loader)
                 self.save_checkpoint(full=False, best=True)
 
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer.close()
 
-    def evaluate(self, loader, valid_poses):
+    def evaluate(self, loader, ):
         self.use_tensorboardX, use_tensorboardX = False, self.use_tensorboardX
-        self.evaluate_one_epoch(loader, valid_poses)
+        self.evaluate_one_epoch(loader)
         self.use_tensorboardX = use_tensorboardX
 
-    def test(self, loader, test_poses, save_path=None):
+    def test(self, loader, save_path=None):
 
         if save_path is None:
             save_path = os.path.join(self.workspace, 'results')
@@ -456,7 +466,7 @@ class Trainer(object):
                 data = self.prepare_data(data)
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth = self.test_step(data, test_poses)
+                    preds, preds_depth = self.test_step(data)
 
                 path = os.path.join(save_path, f'{i:04d}.png')
                 path_depth = os.path.join(save_path, f'{i:04d}_depth.png')
@@ -471,7 +481,7 @@ class Trainer(object):
         self.log(f"==> Finished Test.")
 
     # [GUI] just train for 16 steps, without any other overhead that may slow down rendering.
-    def train_gui(self, train_loader, train_poses, step=16):
+    def train_gui(self, train_loader, step=16):
 
         self.model.train()
 
@@ -498,14 +508,11 @@ class Trainer(object):
             self.global_step += 1
 
             data = self.prepare_data(data)
-            data['N'] = self.loader.dataset.N
-            data['H'] = self.loader.dataset.H
-            data['W'] = self.loader.dataset.W
 
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data, train_poses)
+                preds, truths, loss = self.train_step(data)
 
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -526,6 +533,9 @@ class Trainer(object):
                 self.lr_scheduler.step(average_loss)
             else:
                 self.lr_scheduler.step()
+
+        if self.pose_scheduler:
+            self.pose_scheduler.step()
 
         outputs = {
             'loss': average_loss,
@@ -586,7 +596,7 @@ class Trainer(object):
 
         return data
 
-    def train_one_epoch(self, train_loader, train_poses, max_steps_per_epoch=-1):
+    def train_one_epoch(self, train_loader, max_steps_per_epoch=-1):
         self.log(f"==> Start Training Epoch {self.epoch}, lr={self.optimizer.param_groups[0]['lr']:.6f} ...")
 
         total_loss = 0
@@ -634,19 +644,20 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data, train_poses)
+                preds, truths, loss = self.train_step(data)
 
             self.scaler.scale(loss).backward()
 
-            if self.pose_optimizer:
-                pose_loss = 1e-3 * torch.nn.MSELoss()(train_poses[data['index']].log(),
-                                           lietorch.SE3(data['pose_data']).log())
+#             if self.pose_optimizer:
+#                 pose_loss = 1e-3 * torch.nn.MSELoss()(train_poses[data['index']].log(),
+#                                            lietorch.SE3(data['pose_data']).log())
 
-                self.scaler.scale(pose_loss).backward()
+#                 self.scaler.scale(pose_loss).backward()
 
-                loss += pose_loss
+#                 loss += pose_loss
 
             self.scaler.step(self.optimizer)
+            if self.pose_optimizer: self.scaler.step(self.pose_optimizer)
             self.scaler.update()
 
             if self.scheduler_update_every_step:
@@ -694,7 +705,7 @@ class Trainer(object):
         self.log(f"==> Finished Epoch {self.epoch}.")
 
 
-    def evaluate_one_epoch(self, loader, valid_poses):
+    def evaluate_one_epoch(self, loader):
         self.log(f"++> Evaluate at epoch {self.epoch} ...")
 
         total_loss = 0
@@ -724,7 +735,7 @@ class Trainer(object):
                 data = self.prepare_data(data)
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth, truths, loss = self.eval_step(data, valid_poses)
+                    preds, preds_depth, truths, loss = self.eval_step(data)
 
 
                 # all_gather/reduce the statistics (NCCL only support all_*)
@@ -956,6 +967,7 @@ def SE3_from_transform(T):
     return pose_data
 
 def create_pose_var(dataset, requires_grad=False):
-    pose_var = lietorch.LieGroupParameter(dataset.poses, requires_grad=requires_grad)
+    pose_var = lietorch.LieGroupParameter(dataset.poses.cuda())
+    pose_var.requires_grad = requires_grad
 
     return pose_var

@@ -215,6 +215,7 @@ class NeRFDataset(Dataset):
             'directions': self.all_directions[index],
             'pose_data': self.all_poses.data[index].detach(),
             'index': index,
+            'dims': (self.N, self.H, self.W)
         }
 
         if self.type != 'test' or self.mode == 'blender':

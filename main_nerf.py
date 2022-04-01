@@ -79,8 +79,11 @@ if __name__ == '__main__':
                 # Create and attach poses to trainer
                 train_pose_vars = create_pose_var(train_dataset, requires_grad=opt.opt_poses)
                 trainer.train_pose_vars = train_pose_vars
-                pose_optimizer = lambda model: torch.optim.Adam([train_pose_vars])
+                pose_optimizer = torch.optim.SGD([train_pose_vars], lr=1e-5, momentum=0.5)
                 trainer.pose_optimizer = pose_optimizer
+                trainer.H = train_dataset.H
+                trainer.W = train_dataset.W
+                trainer.pose_scheduler = optim.lr_scheduler.MultiStepLR(pose_optimizer, milestones=[50,100,150], gamma=1.)
 
             gui = NeRFGUI(opt, trainer)
             gui.render()
@@ -93,14 +96,17 @@ if __name__ == '__main__':
                 train_pose_vars= create_pose_var(train_dataset,
                                                  requires_grad=opt.opt_poses)
                 trainer.train_pose_vars = train_pose_vars
-                pose_optimizer = lambda model: torch.optim.Adam([train_pose_vars])
+                pose_optimizer = torch.optim.SGD([train_pose_vars], lr=1e-5, momentum=0.5)
                 trainer.pose_optimizer = pose_optimizer
+                trainer.pose_scheduler = optim.lr_scheduler.MultiStepLR(pose_optimizer, milestones=[50,100,150], gamma=1.)
+                trainer.H = train_dataset.H
+                trainer.W = train_dataset.W
 
             valid_dataset = NeRFDataset(opt.path, type='val', mode=opt.mode, downscale=2, scale=opt.scale, preload=opt.preload)
             valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1, pin_memory=True)
 
             # train 200 epochs, each epoch has 100 steps --> in total 20,000 steps
-            trainer.train(train_loader, valid_loader, 50, 100)
+            trainer.train(train_loader, valid_loader, 200, 100)
 
             # also test
             test_dataset = NeRFDataset(opt.path, type='test', mode=opt.mode, scale=opt.scale, preload=opt.preload)
