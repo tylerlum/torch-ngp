@@ -26,7 +26,7 @@ def nerf_matrix_to_ngp(pose, scale=0.33):
 
 class NeRFDataset(Dataset):
     def __init__(self, path, type='train', mode='colmap', preload=False,
-                 downscale=1, scale=0.33, n_test=10, pose_noise=0.0):
+                 downscale=1, scale=0.33, n_test=10, trans_noise=0.0, rot_noise=0.0):
         super().__init__()
         # path: the json file path.
 
@@ -107,7 +107,7 @@ class NeRFDataset(Dataset):
             self.images = []
             for f in frames:
                 f_path = os.path.join(self.root_path, f['file_path'])
-                if mode == 'blender':
+                if not f_path.lower().endswith(('.jpg', '.jpeg', '.png')):
                     f_path += '.png' # so silly...
 
                 # there are non-exist paths in fox...
@@ -166,9 +166,15 @@ class NeRFDataset(Dataset):
         self.poses = lietorch.SE3(SE3_from_transform(self.poses))
 
         # Add pose noise, if desired.
-        if pose_noise > 0.0 and type == 'train':
-            self.poses = (self.poses.exp(pose_noise * torch.randn(self.N, 7))
-                              * self.poses)
+        if trans_noise > 0. and type == 'train':
+            self.poses.data[:, :3] += trans_noise * torch.randn(self.N, 3)
+
+        # Add rotation noise, if desired.
+        # We do this by sampling a random axis-angle rotation vector + applying to
+        # GT poses.
+        if rot_noise > 0. and type == 'train':
+            rot_vecs = rot_noise * torch.randn(self.N, 3)
+            self.poses = lietorch.SE3(lietorch.SO3.exp(rot_vecs)) * self.poses
 
         self.all_poses = lietorch.SE3(self.poses.data)
         self.all_poses.data = self.all_poses.data.reshape(self.N, 1, 1, 7)

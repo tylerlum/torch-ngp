@@ -945,7 +945,8 @@ def get_config_parser():
     parser.add_argument('--fovy', type=float, default=90, help="default GUI camera fovy")
     parser.add_argument('--max_spp', type=int, default=64, help="GUI rendering max sample per pixel")
     parser.add_argument('--opt_poses', action='store_true', help='Flag to train camera poses in addition to NeRF params')
-    parser.add_argument('--pose_noise', type=float, default=0.0, help='Variance of noise to add to training poses.')
+    parser.add_argument('--trans_noise', type=float, default=0., help='Variance of translation noise to add to GT poses.')
+    parser.add_argument('--rot_noise', type=float, default=0., help='Variance of rotation noise to add to GT poses.')
 
     return parser
 
