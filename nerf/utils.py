@@ -1,6 +1,7 @@
 import argparse
 import os
 import glob
+import sys
 import tqdm
 import random
 import warnings
@@ -28,6 +29,9 @@ from rich.console import Console
 from torch_ema import ExponentialMovingAverage
 
 from kornia import create_meshgrid
+
+from scipy.spatial.transform import Rotation
+import lietorch
 
 def seed_everything(seed):
     random.seed(seed)
@@ -78,10 +82,10 @@ def get_rays(directions, c2w):
         rays_d: (H*W, 3), the normalized direction of the rays in world coordinate
     """
     # Rotate ray directions from camera coordinate to the world coordinate
-    rays_d = directions @ c2w[:3, :3].T  # (H, W, 3)
+    rays_d = lietorch.SO3(c2w).act(directions)
     # rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
     # The origin of all rays is the camera origin in world coordinate
-    rays_o = c2w[:3, 3].expand(rays_d.shape)  # (H, W, 3)
+    rays_o = c2w.translation()[...,:3].expand(rays_d.shape)  # (H, W, 3)
 
     return rays_o, rays_d
 
@@ -161,9 +165,12 @@ class Trainer(object):
                  conf, # extra conf
                  model, # network
                  criterion=None, # loss function, if None, assume inline implementation in train_step
+                 train_pose_vars=None, # poses to use for train images
                  optimizer=None, # optimizer
+                 pose_optimizer=None, #optimizer for camera poses
                  ema_decay=None, # if use EMA, set the decay
                  lr_scheduler=None, # scheduler
+                 pose_scheduler=None,
                  metrics=[], # metrics for evaluation, if None, use val_loss to measure performance, else use the first metric.
                  local_rank=0, # which GPU am I
                  world_size=1, # total num of GPUs
@@ -183,6 +190,7 @@ class Trainer(object):
 
         self.name = name
         self.conf = conf
+        self.train_pose_vars = train_pose_vars
         self.mute = mute
         self.metrics = metrics
         self.local_rank = local_rank
@@ -217,10 +225,14 @@ class Trainer(object):
         else:
             self.optimizer = optimizer(self.model)
 
+        self.pose_optimizer = pose_optimizer
+
         if lr_scheduler is None:
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1) # fake scheduler
         else:
             self.lr_scheduler = lr_scheduler(self.optimizer)
+
+        self.pose_scheduler = pose_scheduler
 
         if ema_decay is not None:
             self.ema = ExponentialMovingAverage(self.model.parameters(), decay=ema_decay)
@@ -295,8 +307,24 @@ class Trainer(object):
     ### ------------------------------
 
     def train_step(self, data):
-        rays_o = data['rays_o'] # [N, 3]
-        rays_d = data['rays_d'] # [N, 3]
+        if self.pose_optimizer:
+
+            train_poses = self.train_pose_vars.retr()
+            train_poses.data = train_poses.data.reshape(
+                -1, 1, 1, 7).expand(-1, self.H, self.W, -1)
+            train_poses.data = train_poses.data.reshape(-1, 7)
+
+            rays_o, rays_d = get_rays(data['directions'], train_poses[data['index']])
+
+            # TODO(pculbert): This is a dirty, dirty hack.
+            # Don't mutate things randomly, kids.
+            data['train_poses'] = train_poses[data['index']]
+
+        else:
+
+            rays_o, rays_d = get_rays(data['directions'],
+                                      lietorch.SE3(data['pose_data']))
+
         rgbs = data['rgbs'] # [N, 3/4]
 
         N, C = rgbs.shape
@@ -313,11 +341,16 @@ class Trainer(object):
 
         loss = self.criterion(pred_rgb, rgbs)
 
+#         if self.pose_optimizer:
+#             pose_loss = 1e-1 * torch.nn.MSELoss()(train_poses[data['index']].vec(),
+#                                        lietorch.SE3(data['pose_data']).vec())
+
+#             loss += pose_loss
+
         return pred_rgb, rgbs, loss
 
     def eval_step(self, data):
-        rays_o = data['rays_o'] # [B, H, W, 3]
-        rays_d = data['rays_d'] # [B, H, W, 3]
+        rays_o, rays_d = get_rays(data['directions'], lietorch.SE3(data['pose_data']))
         rgbs = data['rgbs'] # [B, H, W, 3/4]
 
         B, H, W, C = rgbs.shape
@@ -341,8 +374,11 @@ class Trainer(object):
     # moved out bg_color and perturb for more flexible control...
     def test_step(self, data, bg_color=None, perturb=False):
 
-        rays_o = data['rays_o'] # [B, H, W, 3]
-        rays_d = data['rays_d'] # [B, H, W, 3]
+        # Support case for GUI test.
+        if 'rays_o' in data:
+            rays_o, rays_d = data['rays_o'], data['rays_d']
+        else:
+            rays_o, rays_d = get_rays(data['directions'], lietorch.SE3(data['pose_data']))
         B, H, W, _ = rays_o.shape
 
         rays_o = rays_o.view(-1, 3)
@@ -408,7 +444,7 @@ class Trainer(object):
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer.close()
 
-    def evaluate(self, loader):
+    def evaluate(self, loader, ):
         self.use_tensorboardX, use_tensorboardX = False, self.use_tensorboardX
         self.evaluate_one_epoch(loader)
         self.use_tensorboardX = use_tensorboardX
@@ -502,6 +538,9 @@ class Trainer(object):
                 self.lr_scheduler.step(average_loss)
             else:
                 self.lr_scheduler.step()
+
+        if self.pose_scheduler:
+            self.pose_scheduler.step()
 
         outputs = {
             'loss': average_loss,
@@ -612,8 +651,20 @@ class Trainer(object):
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 preds, truths, loss = self.train_step(data)
 
+            # Memory hack -- compute the pose reg grads separately.
+            if self.pose_optimizer:
+                pose_loss = 1e-3 * torch.nn.MSELoss()(data['train_poses'].vec(),
+                                           lietorch.SE3(data['pose_data']).vec())
+
+                # This adds the regularization grads to the existing loss grads
+                # for the pose vars.
+                self.scaler.scale(pose_loss).backward(retain_graph=True)
+
             self.scaler.scale(loss).backward()
+
             self.scaler.step(self.optimizer)
+
+            if self.pose_optimizer: self.scaler.step(self.pose_optimizer)
             self.scaler.update()
 
             if self.scheduler_update_every_step:
@@ -899,5 +950,32 @@ def get_config_parser():
     parser.add_argument('--radius', type=float, default=5, help="default GUI camera radius from center")
     parser.add_argument('--fovy', type=float, default=90, help="default GUI camera fovy")
     parser.add_argument('--max_spp', type=int, default=64, help="GUI rendering max sample per pixel")
+    parser.add_argument('--opt_poses', action='store_true', help='Flag to train camera poses in addition to NeRF params')
+    parser.add_argument('--trans_noise', type=float, default=0., help='Variance of translation noise to add to GT poses.')
+    parser.add_argument('--rot_noise', type=float, default=0., help='Variance of rotation noise to add to GT poses.')
 
     return parser
+
+def SE3_from_transform(T):
+    """
+    Constructs a lietorch.SE3 object from a batch of transform matrices.
+    Args:
+        T: batch of numpy transform matrices, [B, 4, 4].
+    Returns a lietorch.SE3 object with the correct data.
+    """
+    # Check if we need to add a batch dim.
+    if len(T.shape) < 3:
+        T = T.view(1, 4, 4)
+
+    q = Rotation.from_matrix(T[..., :3, :3]).as_quat()
+    p = T[..., :3, -1]
+
+    pose_data = torch.from_numpy(np.concatenate([p,q], -1)).float()
+
+    return pose_data
+
+def create_pose_var(dataset, requires_grad=False):
+    pose_var = lietorch.LieGroupParameter(dataset.poses.cuda())
+    pose_var.requires_grad = requires_grad
+
+    return pose_var
