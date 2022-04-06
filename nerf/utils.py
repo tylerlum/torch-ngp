@@ -316,6 +316,10 @@ class Trainer(object):
 
             rays_o, rays_d = get_rays(data['directions'], train_poses[data['index']])
 
+            # TODO(pculbert): This is a dirty, dirty hack.
+            # Don't mutate things randomly, kids.
+            data['train_poses'] = train_poses[data['index']]
+
         else:
 
             rays_o, rays_d = get_rays(data['directions'],
@@ -337,11 +341,11 @@ class Trainer(object):
 
         loss = self.criterion(pred_rgb, rgbs)
 
-        if self.pose_optimizer:
-            pose_loss = 1e-1 * torch.nn.MSELoss()(train_poses[data['index']].vec(),
-                                       lietorch.SE3(data['pose_data']).vec())
+#         if self.pose_optimizer:
+#             pose_loss = 1e-1 * torch.nn.MSELoss()(train_poses[data['index']].vec(),
+#                                        lietorch.SE3(data['pose_data']).vec())
 
-            loss += pose_loss
+#             loss += pose_loss
 
         return pred_rgb, rgbs, loss
 
@@ -371,7 +375,7 @@ class Trainer(object):
     def test_step(self, data, bg_color=None, perturb=False):
 
         # Support case for GUI test.
-        if data.has_key('rays_o'):
+        if 'rays_o' in data:
             rays_o, rays_d = data['rays_o'], data['rays_d']
         else:
             rays_o, rays_d = get_rays(data['directions'], lietorch.SE3(data['pose_data']))
@@ -647,17 +651,19 @@ class Trainer(object):
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 preds, truths, loss = self.train_step(data)
 
+            # Memory hack -- compute the pose reg grads separately.
+            if self.pose_optimizer:
+                pose_loss = 1e-3 * torch.nn.MSELoss()(data['train_poses'].vec(),
+                                           lietorch.SE3(data['pose_data']).vec())
+
+                # This adds the regularization grads to the existing loss grads
+                # for the pose vars.
+                self.scaler.scale(pose_loss).backward(retain_graph=True)
+
             self.scaler.scale(loss).backward()
 
-#             if self.pose_optimizer:
-#                 pose_loss = 1e-3 * torch.nn.MSELoss()(train_poses[data['index']].log(),
-#                                            lietorch.SE3(data['pose_data']).log())
-
-#                 self.scaler.scale(pose_loss).backward()
-
-#                 loss += pose_loss
-
             self.scaler.step(self.optimizer)
+
             if self.pose_optimizer: self.scaler.step(self.pose_optimizer)
             self.scaler.update()
 
