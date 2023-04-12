@@ -81,6 +81,15 @@ def get_rays(directions, c2w):
         rays_o: (H*W, 3), the origin of the rays in world coordinate
         rays_d: (H*W, 3), the normalized direction of the rays in world coordinate
     """
+    if not isinstance(c2w, lietorch.SE3):
+        c2w = SE3_from_transform(c2w)
+
+        # Need to be able to broadcast c2w and directions
+        while len(c2w.shape) < len(directions.shape):
+            c2w = c2w[None, ...]
+
+        c2w = lietorch.SE3(c2w)
+
     # Rotate ray directions from camera coordinate to the world coordinate
     rays_d = lietorch.SO3(c2w).act(directions)
     # rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
