@@ -82,11 +82,14 @@ def get_rays(directions, c2w):
         rays_d: (H*W, 3), the normalized direction of the rays in world coordinate
     """
     if not isinstance(c2w, lietorch.SE3):
+        print("WARNING FROM TYLER: Converting c2w is not SE3, converting...")
         c2w = SE3_from_transform(c2w)
 
         # Need to be able to broadcast c2w and directions
         while len(c2w.shape) < len(directions.shape):
             c2w = c2w[None, ...]
+
+        print(f"WARNING FROM TYLER: Done converting c2w to shape = {c2w.shape}")
 
         c2w = lietorch.SE3(c2w)
 
