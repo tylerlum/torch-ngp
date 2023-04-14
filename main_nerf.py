@@ -62,7 +62,7 @@ if __name__ == "__main__":
                 ],
                 lr=1e-2,
                 betas=(0.9, 0.99),
-                eps=1e-1,
+                eps=1e-15,
             )
 
         # need different milestones for GUI/CMD mode.
