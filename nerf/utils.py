@@ -939,6 +939,7 @@ def get_config_parser():
     parser.add_argument('--workspace', type=str, default='workspace')
     parser.add_argument('--seed', type=int, default=0)
     ### training options
+    parser.add_argument('--max_epochs', type=int, default=200)
     parser.add_argument('--num_rays', type=int, default=4096)
     parser.add_argument('--cuda_ray', action='store_true', help="use CUDA raymarching instead of pytorch")
     # (only valid when not using --cuda_ray)

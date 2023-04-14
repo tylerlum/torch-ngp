@@ -143,7 +143,7 @@ if __name__ == "__main__":
             trainer.train(
                 train_loader=train_loader,
                 valid_loader=valid_loader,
-                max_epochs=200,
+                max_epochs=opt.max_epochs,
                 max_steps_per_epoch=100,
             )
 
