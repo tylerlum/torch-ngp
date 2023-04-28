@@ -12,16 +12,22 @@ OMP_NUM_THREADS=8 CUDA_VISIBLE_DEVICES=0 python main_nerf.py data/isaac_Nintendo
 """
 
 
-acronym_object_classes = [folder for folder in os.listdir("data") if folder.startswith("isaac") and '.' in folder]
+acronym_object_classes = sorted([folder for folder in os.listdir("data") if folder.startswith("isaac") and '.' in folder])
 print(f"Found {len(acronym_object_classes)} objects in the acronym dataset")
 print(f"First 10: {acronym_object_classes[:10]}")
 
 num_failed = 0
-for acronym_object_class in (pbar := tqdm(acronym_object_classes)):
+for i in (pbar := tqdm(range(len(acronym_object_classes)))):
+    acronym_object_class = acronym_object_classes[i]
     pbar.set_description(f"num_failed = {num_failed}")
 
+    output_path = f"../nerf_checkpoints/{acronym_object_class}"
+    if os.path.exists(output_path):
+        print(f"output_path = {output_path} already exists, skipping")
+        continue
+
     try:
-        command = f"OMP_NUM_THREADS=8 CUDA_VISIBLE_DEVICES=0 python main_nerf.py data/{acronym_object_class} --workspace  ../nerf_checkpoints/{acronym_object_class} --cuda_ray --bound 2 --scale 1.0 --mode blender --fp16"
+        command = f"OMP_NUM_THREADS=8 CUDA_VISIBLE_DEVICES=0 python main_nerf.py data/{acronym_object_class} --workspace {output_path} --cuda_ray --bound 2 --scale 1.0 --mode blender --fp16"
         print(f"Running command: {command}")
         subprocess.run(command, shell=True, check=True)
     except Exception as e:
