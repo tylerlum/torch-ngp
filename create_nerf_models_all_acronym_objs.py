@@ -17,7 +17,15 @@ print(f"Found {len(acronym_object_classes)} objects in the acronym dataset")
 print(f"First 10: {acronym_object_classes[:10]}")
 
 num_failed = 0
-for i in (pbar := tqdm(range(len(acronym_object_classes)))):
+
+indices = list(range(len(acronym_object_classes)))
+RANDOMIZE_ORDER = True
+if RANDOMIZE_ORDER:
+    print(f"Randomizing order...")
+    import random
+    random.shuffle(indices)
+
+for i in (pbar := tqdm(indices)):
     acronym_object_class = acronym_object_classes[i]
     pbar.set_description(f"num_failed = {num_failed}")
 
