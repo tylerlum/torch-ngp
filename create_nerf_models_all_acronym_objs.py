@@ -7,7 +7,7 @@ Create nerf models for all objects in the acronym dataset
 
 For example:
 ```
-OMP_NUM_THREADS=8 CUDA_VISIBLE_DEVICES=0 python main_nerf.py data/isaac_NintendoDS_1ce1db5e6f9b9accf3ddd47627ca960_0.0378025115 --workspace ../nerf_checkpoints/isaac_NintendoDS_1ce1db5e6f9b9accf3ddd47627ca960_0.0378025115/ --cuda_ray --bound 2 --scale 1.0 --mode blender --fp16
+OMP_NUM_THREADS=8 CUDA_VISIBLE_DEVICES=0 python main_nerf.py data/isaac_NintendoDS_1ce1db5e6f9b9accf3ddd47627ca960_0.0378025115 --workspace ../nerf_checkpoints/isaac_NintendoDS_1ce1db5e6f9b9accf3ddd47627ca960_0.0378025115/ --cuda_ray --bound 2 --scale 1.0 --mode blender --fp16 --max_epochs 100
 ```
 """
 
@@ -35,7 +35,7 @@ for i in (pbar := tqdm(indices)):
         continue
 
     try:
-        command = f"OMP_NUM_THREADS=8 CUDA_VISIBLE_DEVICES=0 python main_nerf.py data/{acronym_object_class} --workspace {output_path} --cuda_ray --bound 2 --scale 1.0 --mode blender --fp16"
+        command = f"OMP_NUM_THREADS=8 CUDA_VISIBLE_DEVICES=0 python main_nerf.py data/{acronym_object_class} --workspace {output_path} --cuda_ray --bound 2 --scale 1.0 --mode blender --fp16 --max_epochs 100"
         print(f"Running command: {command}")
         subprocess.run(command, shell=True, check=True)
     except Exception as e:
