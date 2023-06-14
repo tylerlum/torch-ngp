@@ -147,6 +147,13 @@ class NeRFDataset(Dataset):
             fl_y = (transform['fl_y'] if 'fl_y' in transform else transform['fl_x']) / downscale
         elif 'camera_angle_x' in transform or 'camera_angle_y' in transform:
             # blender, assert in radians. already downscaled since we use H/W
+            if self.H is None or self.W is None:
+                print("=" * 100)
+                print("WARNING FROM TYLER: N IMAGE SO DON'T KNOW H OR W")
+                self.H, self.W = 400, 400
+                print(f"Guesstimated H and W to be {self.H} and {self.W}")
+                print("=" * 100)
+
             fl_x = self.W / (2 * np.tan(transform['camera_angle_x'] / 2)) if 'camera_angle_x' in transform else None
             fl_y = self.H / (2 * np.tan(transform['camera_angle_y'] / 2)) if 'camera_angle_y' in transform else None
             if fl_x is None: fl_x = fl_y

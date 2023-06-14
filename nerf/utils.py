@@ -81,6 +81,18 @@ def get_rays(directions, c2w):
         rays_o: (H*W, 3), the origin of the rays in world coordinate
         rays_d: (H*W, 3), the normalized direction of the rays in world coordinate
     """
+    if not isinstance(c2w, lietorch.SE3):
+        print("WARNING FROM TYLER: Converting c2w is not SE3, converting...")
+        c2w = SE3_from_transform(c2w)
+
+        # Need to be able to broadcast c2w and directions
+        while len(c2w.shape) < len(directions.shape):
+            c2w = c2w[None, ...]
+
+        print(f"WARNING FROM TYLER: Done converting c2w to shape = {c2w.shape}")
+
+        c2w = lietorch.SE3(c2w)
+
     # Rotate ray directions from camera coordinate to the world coordinate
     rays_d = lietorch.SO3(c2w).act(directions)
     # rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
@@ -927,6 +939,7 @@ def get_config_parser():
     parser.add_argument('--workspace', type=str, default='workspace')
     parser.add_argument('--seed', type=int, default=0)
     ### training options
+    parser.add_argument('--max_epochs', type=int, default=200)
     parser.add_argument('--num_rays', type=int, default=4096)
     parser.add_argument('--cuda_ray', action='store_true', help="use CUDA raymarching instead of pytorch")
     # (only valid when not using --cuda_ray)
